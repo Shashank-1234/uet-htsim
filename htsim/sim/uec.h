@@ -220,6 +220,7 @@ public:
 
     static bool update_base_rtt_on_nack;
     static bool _enable_sleek;
+    static bool _nscc_csig_enabled;
 
     virtual const string& nodename() { return _nodename; }
     virtual void setName(const string& name) override { _name=name; _mp->set_debug_tag(name); }
@@ -291,7 +292,29 @@ public:
     mem_b handleCumulativeAck(UecDataPacket::seq_t cum_ack);
     void processAck(const UecAckPacket& pkt);
     void processNack(const UecNackPacket& pkt);
+    void processAckCcx(const UecAckCcxPacket& pkt);
+    void processNackCcx(const UecNackCcxPacket& pkt);
     void processPull(const UecPullPacket& pkt);
+
+    // Common bookkeeping shared by processAck and processAckCcx.
+    struct AckFields {
+        UecBasePacket::seq_t cum_ack;
+        UecBasePacket::seq_t acked_psn;
+        UecBasePacket::seq_t ref_ack;
+        uint64_t bitmap;
+        uint64_t recvd_bytes;
+        uint8_t rcv_wnd_pen;
+        uint16_t ev;
+        uint32_t ooo;
+        bool ecn_echo;
+        bool rtx_echo;
+        bool is_rts;
+        bool is_probe_ack;
+    };
+    void processAckCommon(const AckFields& f, simtime_picosec delay,
+                          simtime_picosec raw_rtt, simtime_picosec send_time,
+                          mem_b pkt_size);
+
     void runSleek(uint32_t ooo, UecBasePacket::seq_t cum_ack);
 
     //added for NSCC
@@ -379,7 +402,7 @@ private:
     void proportional_increase(uint32_t newly_acked_bytes,simtime_picosec delay);
     void fast_increase(uint32_t newly_acked_bytes,simtime_picosec delay);
     // void fair_decrease(bool can_decrease, uint32_t newly_acked_bytes);
-    void multiplicative_decrease();
+    void multiplicative_decrease(simtime_picosec delay);
     void fulfill_adjustment();
     void mark_packet_for_retransmission(UecBasePacket::seq_t psn, uint16_t pktsize);
     void update_delay(simtime_picosec delay, bool update_avg, bool skip);
@@ -503,8 +526,10 @@ class UecSink : public DataReceiver {
     UecBasePacket::seq_t sackBitmapBaseIdeal();
     uint64_t buildSackBitmap(UecBasePacket::seq_t ref_epsn);
     UecAckPacket* sack(uint16_t path_id, UecBasePacket::seq_t seqno, UecBasePacket::seq_t acked_psn, bool ce, bool rtx_echo);
+    UecAckCcxPacket* sack_ccx(uint16_t path_id, UecBasePacket::seq_t seqno, UecBasePacket::seq_t acked_psn, bool ce, bool rtx_echo, uint32_t csig_delay_ns);
 
     UecNackPacket* nack(uint16_t path_id, UecBasePacket::seq_t seqno, bool last_hop, bool ecn_echo);
+    UecNackCcxPacket* nack_ccx(uint16_t path_id, UecBasePacket::seq_t seqno, bool last_hop, bool ecn_echo, uint32_t csig_delay_ns);
 
     UecBasePacket::pull_quanta backlog() {
         if (_highest_pull_target > _latest_pull)

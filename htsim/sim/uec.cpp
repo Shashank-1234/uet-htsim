@@ -36,6 +36,7 @@ uint16_t UecSink::_mtus_per_pull = 4;
 UecBasePacket::pull_quanta UecSink::_credit_per_pull = (UecSrc::_mss * UecSink::_mtus_per_pull) >> UEC_PULL_SHIFT;
 
 bool UecSrc::_debug = false;
+bool UecSrc::_nscc_csig_enabled = false;
 
 bool UecSrc::_sender_based_cc = false;
 bool UecSrc::_receiver_based_cc = false;
@@ -649,6 +650,16 @@ void UecSrc::receivePacket(Packet& pkt, uint32_t portnum) {
             pkt.free();
             return;
         }
+        case UECACKCCX: {
+            processAckCcx((const UecAckCcxPacket&)pkt);
+            pkt.free();
+            return;
+        }
+        case UECNACKCCX: {
+            processNackCcx((const UecNackCcxPacket&)pkt);
+            pkt.free();
+            return;
+        }
         default: {
             cout << "UecSrc::receivePacket receive default\n";
 
@@ -901,117 +912,32 @@ bool UecSrc::validateSendTs(UecBasePacket::seq_t acked_psn, bool rtx_echo) {
     }
 }
 
-void UecSrc::processAck(const UecAckPacket& pkt) {
-    _nic.logReceivedCtrl(pkt.size());
-    
-    auto cum_ack = pkt.cumulative_ack();
-    bool rtx_echo = pkt.rtx_echo();
-    //handle flight_size based on recvd_bytes in packet.
-    uint64_t newly_recvd_bytes = 0;
-
-    if (pkt.recvd_bytes() > _recvd_bytes){
-        newly_recvd_bytes = pkt.recvd_bytes() - _recvd_bytes;
-        _recvd_bytes = pkt.recvd_bytes();
-
+void UecSrc::processAckCommon(const AckFields& f, simtime_picosec delay,
+                              simtime_picosec raw_rtt, simtime_picosec send_time,
+                              mem_b pkt_size) {
+    uint64_t newly_recvd_bytes = f.recvd_bytes > _recvd_bytes ? f.recvd_bytes - _recvd_bytes : 0;
+    if (newly_recvd_bytes > 0) {
+        _recvd_bytes = f.recvd_bytes;
         _achieved_bytes += newly_recvd_bytes;
         _received_bytes += newly_recvd_bytes;
         _bytes_ignored += newly_recvd_bytes;
     }
 
-    if (_debug_src) {
-        cout << "processAck " << cum_ack << " ref_epsn " << pkt.acked_psn() << " recvd_bytes " << _recvd_bytes << " newly_recvd_bytes " << newly_recvd_bytes << endl;
-    }
     _stats.acks_received++;
-
-    //decrease flightsize.
     _in_flight -= newly_recvd_bytes;
-    // We cannot run this next line's check here since 
-    // _in_flight could be corrected (increased) in either
-    // handleCumulativeAck or handleAckno.
-    // assert(_in_flight >= 0);
 
-    if (_sender_based_cc && pkt.rcv_wnd_pen() < 255) {
-            sint64_t window_decrease = newly_recvd_bytes - newly_recvd_bytes * pkt.rcv_wnd_pen() / 255;
+    if (_sender_based_cc && f.rcv_wnd_pen < 255) {
+            sint64_t window_decrease = newly_recvd_bytes - newly_recvd_bytes * f.rcv_wnd_pen / 255;
             _cwnd = max(_cwnd-window_decrease, (mem_b)_mtu);
     }
 
-    //compute RTT sample
-    auto acked_psn = pkt.acked_psn();
-    auto i = _tx_bitmap.find(acked_psn);
-    auto rtx_time = _rtx_times.find(acked_psn);
-    uint32_t ooo = pkt.ooo();
-
-    mem_b pkt_size;
-    simtime_picosec delay;
-    simtime_picosec raw_rtt = 0;
-    simtime_picosec send_time = 0;
-
-    if (i != _tx_bitmap.end() && validateSendTs(acked_psn, pkt.rtx_echo()) && (!pkt.is_probe_ack()) ) {
-    //a timestamp is valid if 
-    //1. the received ack is new packet and no retransmission at local record;
-    //or 2. the received ack is a retransmitted packet and local record shows this packet only gets retransmitted once. 
-        if(_flow.flow_id() == _debug_flowid ){
-            cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id() 
-                << " rtx_times "<< rtx_time->second
-                << " rtx_echo " << rtx_echo 
-                << " packet_type " << pkt.is_probe_ack()
-                << " _probe_psn " << _probe_seqno
-                << " psn " << pkt.acked_psn()
-                << endl;
-        }
-        //auto seqno = i->first;
-        send_time = i->second.send_time;
-        pkt_size = i->second.pkt_size;
-        raw_rtt = eventlist().now() - send_time;
-
-        if (!pkt.is_rts()) {
-            update_base_rtt(raw_rtt);
-        }
-        
-        if (raw_rtt >= _base_rtt) {
-            update_delay(raw_rtt, true, pkt.ecn_echo());
-            delay = raw_rtt - _base_rtt; 
-        } else {
-            delay = get_avg_delay();
-        }
-    } else {
-        // this can happen when the ACK arrives later than a cumulative ACK covering the NACKed
-        // packet.
-        if (UecSrc::_debug)
-            cout << "Can't find send record for seqno " << acked_psn << endl;
-        if (pkt.is_probe_ack()){
-            if (_probe_seqno == pkt.acked_psn()){
-                _raw_rtt = eventlist().now() - _probe_send_time ;
-                if (_raw_rtt < _base_rtt){
-                    delay = 0;
-                    _raw_rtt = _base_rtt;
-                }else{
-                    delay = _raw_rtt - _base_rtt;
-                    update_delay(_raw_rtt, true, pkt.ecn_echo());
-                }
-                if(_flow.flow_id() == _debug_flowid ){
-                    cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id() << " _probe_seqno " << _probe_seqno
-                        << " delay " << timeAsUs(delay) 
-                        << endl;
-                }
-            }else{
-                delay = get_avg_delay();
-            }
-            pkt_size = 0;
-        }else{
-            pkt_size = _mtu;
-            delay = get_avg_delay();
-        }
-    }
-
-    handleCumulativeAck(cum_ack);
+    handleCumulativeAck(f.cum_ack);
 
     if (_debug_src)
-        cout << "At " << timeAsUs(eventlist().now()) << " " << _flow.str() << " " << _nodename << " processAck cum_ack: " << cum_ack << " flow " << _flow.str() << endl;
+        cout << "At " << timeAsUs(eventlist().now()) << " " << _flow.str() << " " << _nodename << " processAck cum_ack: " << f.cum_ack << " flow " << _flow.str() << endl;
 
-    auto ackno = pkt.ref_ack();
-
-    uint64_t bitmap = pkt.bitmap();
+    auto ackno = f.ref_ack;
+    uint64_t bitmap = f.bitmap;
 
     if (_debug_src)
         cout << "    ref_ack: " << ackno << " bitmap: " << bitmap << endl;
@@ -1030,76 +956,146 @@ void UecSrc::processAck(const UecAckPacket& pkt) {
         bitmap >>= 1;
     }
 
-    // We ran both potential _in_flight correcting functions
-    // now check if we are in the negative.
-    //assert(_in_flight >= 0);
-
-
-    _mp->processEv(pkt.ev(), pkt.ecn_echo() ? UecMultipath::PATH_ECN : UecMultipath::PATH_GOOD);
+    _mp->processEv(f.ev, f.ecn_echo ? UecMultipath::PATH_ECN : UecMultipath::PATH_GOOD);
 
     if(_flow.flow_id() == _debug_flowid ){
         cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id() << " track_avg_rtt " << timeAsUs(get_avg_delay())
-            << " rtt " << timeAsUs(raw_rtt) << " skip " << pkt.ecn_echo()  << " ev " << pkt.ev()
-            << " cum_ack " << cum_ack
-            << " bitmap_base " << pkt.ref_ack()
-            << " ooo " << ooo
+            << " rtt " << timeAsUs(raw_rtt) << " skip " << f.ecn_echo  << " ev " << f.ev
+            << " cum_ack " << f.cum_ack
+            << " bitmap_base " << f.ref_ack
+            << " ooo " << f.ooo
             << " cwnd " << _cwnd/get_avg_pktsize()
             << " _achieved_bytes " << _achieved_bytes
-            << " acked_psn " << acked_psn
+            << " acked_psn " << f.acked_psn
             << " sending_time " << timeAsUs(send_time)
             << endl;
     }
     if (_sender_based_cc){
-        /*if (pkt.ecn_echo()){
-            (this->*updateCwndOnAck)(pkt.ecn_echo(), delay, pkt_size);
-            (this->*updateCwndOnAck)(false, delay, newly_recvd_bytes - pkt_size);
-        }
-        else */
-        (this->*updateCwndOnAck)(pkt.ecn_echo(), delay, newly_recvd_bytes);
+        (this->*updateCwndOnAck)(f.ecn_echo, delay, newly_recvd_bytes);
     }
 
     if (_debug_src) {
-        cout << "At " << timeAsUs(eventlist().now()) << " " << _flow.str() << " " << _nodename << " processAck: " << cum_ack << " flow " << _flow.str() << " cwnd " << _cwnd << " flightsize " << _in_flight << " delay " << timeAsUs(delay) << " newlyrecvd " << newly_recvd_bytes << " skip " << pkt.ecn_echo() << " raw rtt " << raw_rtt << endl;
+        cout << "At " << timeAsUs(eventlist().now()) << " " << _flow.str() << " " << _nodename << " processAck: " << f.cum_ack << " flow " << _flow.str() << " cwnd " << _cwnd << " flightsize " << _in_flight << " delay " << timeAsUs(delay) << " newlyrecvd " << newly_recvd_bytes << " skip " << f.ecn_echo << " raw rtt " << raw_rtt << endl;
     }
 
     if (_sender_based_cc && _enable_sleek) {
-        //probe packets
         if (_probe_timer_when != 0){
             if (_probe_timer_handle->second != this){
                 if(_flow.flow_id() == _debug_flowid ){
                     cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id() << " an assert soon"<< endl;
-                }                
+                }
             }
             eventlist().cancelPendingSourceByHandle(*this, _probe_timer_handle);
             _probe_timer_when = 0;
             _probe_timer_handle = eventlist().nullHandle();
         }
-        if (cum_ack < _highest_sent || _backlog > 0){
+        if (f.cum_ack < _highest_sent || _backlog > 0){
             if (_backlog == 0){
-                _probe_timer_when = eventlist().now() + (_base_rtt+_target_Qdelay);            
+                _probe_timer_when = eventlist().now() + (_base_rtt+_target_Qdelay);
             }else{
                 _probe_timer_when = eventlist().now() + probe_first_trial_time*_base_rtt;
             }
             _probe_timer_handle = eventlist().sourceIsPendingGetHandle(*this, _probe_timer_when);
         }
-        if(pkt.is_probe_ack() && delay < _target_Qdelay){
+        if(f.is_probe_ack && delay < _target_Qdelay){
             _loss_recovery_mode = true;
             _recovery_seqno = _highest_sent;
-            _highest_rtx_sent = cum_ack;
+            _highest_rtx_sent = f.cum_ack;
             if(_flow.flow_id() == _debug_flowid ){
                 cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id() << " enter_loss_probe " << " _avg_delay " << timeAsUs(_avg_delay)<< endl;
             }
         }
-        runSleek(ooo, cum_ack);
+        runSleek(f.ooo, f.cum_ack);
     }
 
     stopSpeculating();
 
-    if (checkFinished(cum_ack)) {
+    if (checkFinished(f.cum_ack)) {
         return;
     }
 
     sendIfPermitted();
+}
+
+void UecSrc::processAck(const UecAckPacket& pkt) {
+    _nic.logReceivedCtrl(pkt.size());
+
+    auto acked_psn = pkt.acked_psn();
+    auto i = _tx_bitmap.find(acked_psn);
+    auto rtx_time = _rtx_times.find(acked_psn);
+    bool rtx_echo = pkt.rtx_echo();
+
+    mem_b pkt_size;
+    simtime_picosec delay;
+    simtime_picosec raw_rtt = 0;
+    simtime_picosec send_time = 0;
+
+    if (i != _tx_bitmap.end() && validateSendTs(acked_psn, pkt.rtx_echo()) && (!pkt.is_probe_ack()) ) {
+        if(_flow.flow_id() == _debug_flowid ){
+            cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id()
+                << " rtx_times "<< rtx_time->second
+                << " rtx_echo " << rtx_echo
+                << " packet_type " << pkt.is_probe_ack()
+                << " _probe_psn " << _probe_seqno
+                << " psn " << pkt.acked_psn()
+                << endl;
+        }
+        send_time = i->second.send_time;
+        pkt_size = i->second.pkt_size;
+        raw_rtt = eventlist().now() - send_time;
+
+        if (!pkt.is_rts()) {
+            update_base_rtt(raw_rtt);
+        }
+
+        if (raw_rtt >= _base_rtt) {
+            update_delay(raw_rtt, true, pkt.ecn_echo());
+            delay = raw_rtt - _base_rtt;
+        } else {
+            delay = get_avg_delay();
+        }
+    } else {
+        if (UecSrc::_debug)
+            cout << "Can't find send record for seqno " << acked_psn << endl;
+        if (pkt.is_probe_ack()){
+            if (_probe_seqno == pkt.acked_psn()){
+                _raw_rtt = eventlist().now() - _probe_send_time ;
+                if (_raw_rtt < _base_rtt){
+                    delay = 0;
+                    _raw_rtt = _base_rtt;
+                }else{
+                    delay = _raw_rtt - _base_rtt;
+                    update_delay(_raw_rtt, true, pkt.ecn_echo());
+                }
+                if(_flow.flow_id() == _debug_flowid ){
+                    cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id() << " _probe_seqno " << _probe_seqno
+                        << " delay " << timeAsUs(delay)
+                        << endl;
+                }
+            }else{
+                delay = get_avg_delay();
+            }
+            pkt_size = 0;
+        }else{
+            pkt_size = _mtu;
+            delay = get_avg_delay();
+        }
+    }
+
+    AckFields f;
+    f.cum_ack = pkt.cumulative_ack();
+    f.acked_psn = acked_psn;
+    f.ref_ack = pkt.ref_ack();
+    f.bitmap = pkt.bitmap();
+    f.recvd_bytes = pkt.recvd_bytes();
+    f.rcv_wnd_pen = pkt.rcv_wnd_pen();
+    f.ev = pkt.ev();
+    f.ooo = pkt.ooo();
+    f.ecn_echo = pkt.ecn_echo();
+    f.rtx_echo = pkt.rtx_echo();
+    f.is_rts = pkt.is_rts();
+    f.is_probe_ack = pkt.is_probe_ack();
+    processAckCommon(f, delay, raw_rtt, send_time, pkt_size);
 }
 
 void UecSrc::updateCwndOnAck_DCTCP(bool skip, simtime_picosec rtt, mem_b newly_acked_bytes) {
@@ -1237,18 +1233,17 @@ void UecSrc::fast_increase(uint32_t newly_acked_bytes,simtime_picosec delay){
     _increase = false;
 }
 
-void UecSrc::multiplicative_decrease() {
+// Caller supplies the congestion-delay sample used for this update.
+void UecSrc::multiplicative_decrease(simtime_picosec delay) {
     _increase = false;
     _fi_count = 0;
-    simtime_picosec avg_delay = get_avg_delay();
-    if (avg_delay > _target_Qdelay){
+    if (delay > _target_Qdelay){
         if (eventlist().now() - _last_dec_time > _base_rtt){
             mem_b before = _cwnd;
-            _cwnd *= max(1-_gamma*(avg_delay-_target_Qdelay)/avg_delay, 0.5);/*_max_md_jump instead of 1*/
+            _cwnd *= max(1-_gamma*(delay-_target_Qdelay)/delay, 0.5);
             _cwnd = max(_cwnd, _min_cwnd);
             _nscc_overall_stats.dec_multi_bytes += before - _cwnd;
             _nscc_fulfill_stats.dec_multi_bytes += before - _cwnd;
-
             _last_dec_time = eventlist().now();
         }
     }
@@ -1325,8 +1320,8 @@ void UecSrc::updateCwndOnAck_NSCC(bool skip, simtime_picosec delay, mem_b newly_
         if (_flow.flow_id() == _debug_flowid || UecSrc::_debug) {
             cout << timeAsUs(eventlist().now()) <<" flowid " << _flow.flow_id()<< " " << _flow.str() << " proportional_increase _nscc_cwnd " << _cwnd << endl;
         }
-    } else if (skip && delay >= _target_Qdelay) {    
-        multiplicative_decrease();
+    } else if (skip && delay >= _target_Qdelay) {
+        multiplicative_decrease(delay);
         if (_flow.flow_id() == _debug_flowid || UecSrc::_debug) {
             cout << timeAsUs(eventlist().now()) <<" flowid " << _flow.flow_id()<< " " << _flow.str() << " multiplicative_decrease _nscc_cwnd " << _cwnd << endl;
         }
@@ -1592,6 +1587,153 @@ void UecSrc::processNack(const UecNackPacket& pkt) {
     //assert(_in_flight >= 0);
 
     // _send_times.erase(send_time);
+    delFromSendTimes(send_time, seqno);
+
+    stopSpeculating();
+    queueForRtx(seqno, pkt_size);
+
+    if (send_time == _rto_send_time) {
+        recalculateRTO();
+    }
+
+    if (pkt.last_hop())
+        _mp->processEv(ev, pkt.ecn_echo() ? UecMultipath::PATH_ECN : UecMultipath::PATH_GOOD);
+    else
+        _mp->processEv(ev, UecMultipath::PATH_NACK);
+
+    sendIfPermitted();
+}
+
+void UecSrc::processAckCcx(const UecAckCcxPacket& pkt) {
+    assert(pkt.ccx_type() == CCX_TYPE_NSCC_CSIG);
+    _nic.logReceivedCtrl(pkt.size());
+
+    auto acked_psn = pkt.acked_psn();
+    auto i = _tx_bitmap.find(acked_psn);
+    auto rtx_time = _rtx_times.find(acked_psn);
+    bool rtx_echo = pkt.rtx_echo();
+
+    mem_b pkt_size;
+    simtime_picosec raw_rtt = 0;
+    simtime_picosec send_time = 0;
+
+    // In CSIG mode, NSCC uses the reflected bottleneck-delay signal for cwnd
+    // updates. RTT tracking is still maintained for base RTT bookkeeping.
+    simtime_picosec delay = (simtime_picosec)pkt.csig_delay_ns() * 1000;
+
+    if (i != _tx_bitmap.end() && validateSendTs(acked_psn, pkt.rtx_echo()) && (!pkt.is_probe_ack()) ) {
+        if(_flow.flow_id() == _debug_flowid ){
+            cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id()
+                << " rtx_times "<< rtx_time->second
+                << " rtx_echo " << rtx_echo
+                << " packet_type " << pkt.is_probe_ack()
+                << " _probe_psn " << _probe_seqno
+                << " psn " << pkt.acked_psn()
+                << endl;
+        }
+        send_time = i->second.send_time;
+        pkt_size = i->second.pkt_size;
+        raw_rtt = eventlist().now() - send_time;
+
+        if (!pkt.is_rts()) {
+            update_base_rtt(raw_rtt);
+        }
+        if (raw_rtt >= _base_rtt) {
+            update_delay(raw_rtt, true, pkt.ecn_echo());
+        }
+    } else {
+        if (UecSrc::_debug)
+            cout << "Can't find send record for seqno " << acked_psn << endl;
+        if (pkt.is_probe_ack()){
+            if (_probe_seqno == pkt.acked_psn()){
+                _raw_rtt = eventlist().now() - _probe_send_time ;
+                if (_raw_rtt < _base_rtt){
+                    _raw_rtt = _base_rtt;
+                }else{
+                    update_delay(_raw_rtt, true, pkt.ecn_echo());
+                }
+            }
+            pkt_size = 0;
+        }else{
+            pkt_size = _mtu;
+        }
+    }
+
+    AckFields f;
+    f.cum_ack = pkt.cumulative_ack();
+    f.acked_psn = acked_psn;
+    f.ref_ack = pkt.ref_ack();
+    f.bitmap = pkt.bitmap();
+    f.recvd_bytes = pkt.recvd_bytes();
+    f.rcv_wnd_pen = pkt.rcv_wnd_pen();
+    f.ev = pkt.ev();
+    f.ooo = pkt.ooo();
+    f.ecn_echo = pkt.ecn_echo();
+    f.rtx_echo = pkt.rtx_echo();
+    f.is_rts = pkt.is_rts();
+    f.is_probe_ack = pkt.is_probe_ack();
+    processAckCommon(f, delay, raw_rtt, send_time, pkt_size);
+}
+
+void UecSrc::processNackCcx(const UecNackCcxPacket& pkt) {
+    assert(pkt.nccx_type() == NCCX_TYPE_CSIG);
+    _nic.logReceivedCtrl(pkt.size());
+    _stats.nacks_received++;
+
+    auto nacked_seqno = pkt.ref_ack();
+    if (_debug_src) {
+        cout << _flow.str() << " " << _nodename << " processNackCcx nacked: " << nacked_seqno << " flow " << _flow.str()
+             << " csig_delay_ns " << pkt.csig_delay_ns() << endl;
+    }
+
+    uint16_t ev = pkt.ev();
+
+    auto i = _tx_bitmap.find(nacked_seqno);
+    if (i == _tx_bitmap.end()) {
+        if (_debug_src)
+            cout << _flow.str() << " " << "Didn't find NACKed packet in _active_packets flow " << _flow.str() << endl;
+        return;
+    }
+
+    mem_b pkt_size = i->second.pkt_size;
+
+    assert(pkt_size >= _hdr_size);
+    if (pkt_size == _hdr_size) {
+        _stats.rts_nacks++;
+    }
+
+    auto seqno = i->first;
+    simtime_picosec send_time = i->second.send_time;
+    simtime_picosec raw_rtt = eventlist().now() - send_time;
+
+    if (update_base_rtt_on_nack) {
+        update_base_rtt(raw_rtt);
+    }
+
+    if(raw_rtt >= _base_rtt) {
+        update_delay(raw_rtt, false, true);
+    }
+
+    if(_flow.flow_id() == _debug_flowid){
+        cout << timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id() << " ev " << ev
+            << " seqno " << seqno
+            << " trimming (ccx)" << endl;
+    }
+    // NACK_CCX carries the reflected delay for completeness. NSCC currently
+    // keeps the existing NACK control path; consuming NACK-side delay is left
+    // for a later patch.
+    if (_sender_based_cc){
+        (this->*updateCwndOnNack)(ev, pkt_size, pkt.last_hop());
+    }
+
+    if (_debug_src)
+        cout << _flow.str() << " " << _nodename << " erasing send record, seqno: " << seqno << " flow " << _flow.str()
+             << endl;
+    _tx_bitmap.erase(i);
+    assert(_tx_bitmap.find(seqno) == _tx_bitmap.end());
+
+    _in_flight -= pkt_size;
+
     delFromSendTimes(send_time, seqno);
 
     stopSpeculating();
@@ -2083,11 +2225,17 @@ mem_b UecSrc::sendNewPacket(const Route& route) {
     auto* p = UecDataPacket::newpkt(_flow, route, _highest_sent, full_pkt_size, ptype,
                                      _pull_target, _dstaddr);
 
+    if (_nscc_csig_enabled) {
+        p->set_csig_enabled(true);
+        p->set_csig_delay_ns(0);
+        p->set_csig_reflect_req(true);
+    }
+
     uint16_t ev = _mp->nextEntropy(_highest_sent, (uint64_t)_cwnd/_mss);
     p->set_pathid(ev);
     p->flow().logTraffic(*p, *this, TrafficLogger::PKT_CREATESEND);
 
-    if (_backlog == 0 || (_receiver_based_cc && _credit <= 0) || ( _sender_based_cc &&  (_in_flight + full_pkt_size) >= _cwnd )) 
+    if (_backlog == 0 || (_receiver_based_cc && _credit <= 0) || ( _sender_based_cc &&  (_in_flight + full_pkt_size) >= _cwnd ))
         p->set_ar(true);
     
     createSendRecord(_highest_sent, full_pkt_size);
@@ -2127,6 +2275,12 @@ mem_b UecSrc::sendRtxPacket(const Route& route) {
     
     auto* p = UecDataPacket::newpkt(_flow, route, seq_no, full_pkt_size, UecDataPacket::DATA_RTX,
                                      _pull_target, _dstaddr);
+
+    if (_nscc_csig_enabled) {
+        p->set_csig_enabled(true);
+        p->set_csig_delay_ns(0);
+        p->set_csig_reflect_req(true);
+    }
 
     uint16_t ev = _mp->nextEntropy(_highest_sent, (uint64_t)_cwnd/_mss);
     p->set_pathid(ev);
@@ -2571,11 +2725,18 @@ void UecSink::handlePullTarget(UecBasePacket::seq_t pt) {
 void UecSink::processData(UecDataPacket& pkt) {
     bool force_ack = false;
     if (pkt.packet_type() == UecBasePacket::DATA_PROBE){
-        UecAckPacket* ack_packet =
-            sack(pkt.path_id(), sackBitmapBase(pkt.epsn()), pkt.epsn(), (bool)(pkt.flags() & ECN_CE), pkt.retransmitted());
-        ack_packet->set_probe_ack(true);
-        _nic.sendControlPacket(ack_packet, NULL, this);   
-        return;     
+        if (pkt.csig_enabled() && pkt.csig_reflect_req()) {
+            UecAckCcxPacket* ack_packet =
+                sack_ccx(pkt.path_id(), sackBitmapBase(pkt.epsn()), pkt.epsn(), (bool)(pkt.flags() & ECN_CE), pkt.retransmitted(), pkt.csig_delay_ns());
+            ack_packet->set_probe_ack(true);
+            _nic.sendControlPacket(ack_packet, NULL, this);
+        } else {
+            UecAckPacket* ack_packet =
+                sack(pkt.path_id(), sackBitmapBase(pkt.epsn()), pkt.epsn(), (bool)(pkt.flags() & ECN_CE), pkt.retransmitted());
+            ack_packet->set_probe_ack(true);
+            _nic.sendControlPacket(ack_packet, NULL, this);
+        }
+        return;
     }
     //PCIeModel processing
 
@@ -2647,9 +2808,15 @@ void UecSink::processData(UecDataPacket& pkt) {
         // sender is confused and sending us duplicates: ACK straight away.
         // this code is different from the proposed hardware implementation, as it keeps track of
         // the ACK state of OOO packets.
-        UecAckPacket* ack_packet =
-            sack(pkt.path_id(), ecn ? pkt.epsn() : sackBitmapBase(pkt.epsn()), pkt.epsn(), ecn, pkt.retransmitted());
-        _nic.sendControlPacket(ack_packet, NULL, this);
+        if (pkt.csig_enabled() && pkt.csig_reflect_req()) {
+            UecAckCcxPacket* ack_packet =
+                sack_ccx(pkt.path_id(), ecn ? pkt.epsn() : sackBitmapBase(pkt.epsn()), pkt.epsn(), ecn, pkt.retransmitted(), pkt.csig_delay_ns());
+            _nic.sendControlPacket(ack_packet, NULL, this);
+        } else {
+            UecAckPacket* ack_packet =
+                sack(pkt.path_id(), ecn ? pkt.epsn() : sackBitmapBase(pkt.epsn()), pkt.epsn(), ecn, pkt.retransmitted());
+            _nic.sendControlPacket(ack_packet, NULL, this);
+        }
 
         _accepted_bytes = 0;  // careful about this one.
         return;
@@ -2712,29 +2879,51 @@ void UecSink::processData(UecDataPacket& pkt) {
              << " forceack " << force_ack << endl;
     }
     if (ecn || shouldSack() || force_ack) {
-        UecAckPacket* ack_packet =
-            sack(pkt.path_id(), (ecn || pkt.ar()) ? pkt.epsn() : sackBitmapBase(pkt.epsn()), pkt.epsn(), ecn, pkt.retransmitted());
+        if (pkt.csig_enabled() && pkt.csig_reflect_req()) {
+            UecAckCcxPacket* ack_packet =
+                sack_ccx(pkt.path_id(), (ecn || pkt.ar()) ? pkt.epsn() : sackBitmapBase(pkt.epsn()), pkt.epsn(), ecn, pkt.retransmitted(), pkt.csig_delay_ns());
 
-        if (_src->debug()) {
-            cout << " UecSink " << _nodename << " src " << _src->nodename()
-                 << " sendAckNow: " << _expected_epsn << " ref_epsn " << pkt.epsn()
-                 << " ooo_count " << _out_of_order_count
-                 << " recvd_bytes " << _recvd_bytes << " flow " << _src->flow()->str() 
-                 << " ecn " << ecn << " shouldSack " << shouldSack() << " forceack " << force_ack << endl;
+            if (_src->debug()) {
+                cout << " UecSink " << _nodename << " src " << _src->nodename()
+                     << " sendAckCcxNow: " << _expected_epsn << " ref_epsn " << pkt.epsn()
+                     << " ooo_count " << _out_of_order_count
+                     << " recvd_bytes " << _recvd_bytes << " flow " << _src->flow()->str()
+                     << " ecn " << ecn << " csig_delay_ns " << pkt.csig_delay_ns() << endl;
+            }
+
+            if (_src->flow()->flow_id() == UecSrc::_debug_flowid)
+            {
+                cout << timeAsUs(_src->eventlist().now()) << " flowid " << _src->flow()->flow_id()
+                     << " sendAckCcxNow: " << _expected_epsn << " ref_epsn " << pkt.epsn()
+                     << " ooo_count " << _out_of_order_count
+                     << " recvd_bytes " << _recvd_bytes << " flow " << _src->flow()->str()
+                     << " ecn " << ecn << " csig_delay_ns " << pkt.csig_delay_ns() << endl;
+            }
+            _accepted_bytes = 0;
+            _nic.sendControlPacket(ack_packet, NULL, this);
+        } else {
+            UecAckPacket* ack_packet =
+                sack(pkt.path_id(), (ecn || pkt.ar()) ? pkt.epsn() : sackBitmapBase(pkt.epsn()), pkt.epsn(), ecn, pkt.retransmitted());
+
+            if (_src->debug()) {
+                cout << " UecSink " << _nodename << " src " << _src->nodename()
+                     << " sendAckNow: " << _expected_epsn << " ref_epsn " << pkt.epsn()
+                     << " ooo_count " << _out_of_order_count
+                     << " recvd_bytes " << _recvd_bytes << " flow " << _src->flow()->str()
+                     << " ecn " << ecn << " shouldSack " << shouldSack() << " forceack " << force_ack << endl;
+            }
+
+            if (_src->flow()->flow_id() == UecSrc::_debug_flowid)
+            {
+                cout << timeAsUs(_src->eventlist().now()) << " flowid " << _src->flow()->flow_id()
+                     << " sendAckNow: " << _expected_epsn << " ref_epsn " << pkt.epsn()
+                     << " ooo_count " << _out_of_order_count
+                     << " recvd_bytes " << _recvd_bytes << " flow " << _src->flow()->str()
+                     << " ecn " << ecn << " shouldSack " << shouldSack() << " forceack " << force_ack << endl;
+            }
+            _accepted_bytes = 0;
+            _nic.sendControlPacket(ack_packet, NULL, this);
         }
-
-        if (_src->flow()->flow_id() == UecSrc::_debug_flowid)
-        {
-            cout << timeAsUs(_src->eventlist().now()) << " flowid " << _src->flow()->flow_id()
-                 << " sendAckNow: " << _expected_epsn << " ref_epsn " << pkt.epsn()
-                 << " ooo_count " << _out_of_order_count
-                 << " recvd_bytes " << _recvd_bytes << " flow " << _src->flow()->str() 
-                 << " ecn " << ecn << " shouldSack " << shouldSack() << " forceack " << force_ack << endl;
-        }
-        _accepted_bytes = 0;
-
-        // ack_packet->sendOn();
-        _nic.sendControlPacket(ack_packet, NULL, this);
     }
 }
 
@@ -2759,9 +2948,13 @@ void UecSink::processTrimmed(const UecDataPacket& pkt) {
                  << " time " << timeAsNs(getSrc()->eventlist().now()) << " flow"
                  << _src->flow()->str() << endl;
 
-        UecAckPacket* ack_packet = sack(pkt.path_id(), sackBitmapBase(pkt.epsn()), pkt.epsn(), false, pkt.retransmitted());
-        //ack_packet->sendOn();
-        _nic.sendControlPacket(ack_packet, NULL, this);
+        if (pkt.csig_enabled() && pkt.csig_reflect_req()) {
+            UecAckCcxPacket* ack_packet = sack_ccx(pkt.path_id(), sackBitmapBase(pkt.epsn()), pkt.epsn(), false, pkt.retransmitted(), pkt.csig_delay_ns());
+            _nic.sendControlPacket(ack_packet, NULL, this);
+        } else {
+            UecAckPacket* ack_packet = sack(pkt.path_id(), sackBitmapBase(pkt.epsn()), pkt.epsn(), false, pkt.retransmitted());
+            _nic.sendControlPacket(ack_packet, NULL, this);
+        }
         return;
     }
 
@@ -2776,10 +2969,13 @@ void UecSink::processTrimmed(const UecDataPacket& pkt) {
              << " rtx_backlog " << rtx_backlog() << " at " << timeAsUs(getSrc()->eventlist().now())
              << " flow " << _src->flow()->str() << endl;
 
-    UecNackPacket* nack_packet = nack(pkt.path_id(), pkt.epsn(), is_last_hop, (bool)(pkt.flags() & ECN_CE));
-
-    // nack_packet->sendOn();
-    _nic.sendControlPacket(nack_packet, NULL, this);
+    if (pkt.csig_enabled() && pkt.csig_reflect_req()) {
+        UecNackCcxPacket* nack_packet = nack_ccx(pkt.path_id(), pkt.epsn(), is_last_hop, (bool)(pkt.flags() & ECN_CE), pkt.csig_delay_ns());
+        _nic.sendControlPacket(nack_packet, NULL, this);
+    } else {
+        UecNackPacket* nack_packet = nack(pkt.path_id(), pkt.epsn(), is_last_hop, (bool)(pkt.flags() & ECN_CE));
+        _nic.sendControlPacket(nack_packet, NULL, this);
+    }
 
     if (UecSrc::_receiver_based_cc && !_in_pull) {
         // source is now retransmitting, must add it to the list.
@@ -3011,6 +3207,26 @@ UecAckPacket* UecSink::sack(uint16_t path_id, UecBasePacket::seq_t seqno, UecBas
 
 UecNackPacket* UecSink::nack(uint16_t path_id, UecBasePacket::seq_t seqno,bool last_hop, bool ecn_echo) {
     UecNackPacket* pkt = UecNackPacket::newpkt(_flow, NULL, seqno, path_id,  _recvd_bytes,_rcv_cwnd_pen,_srcaddr);
+    pkt->set_last_hop(last_hop);
+    pkt->set_ecn_echo(ecn_echo);
+    return pkt;
+}
+
+UecAckCcxPacket* UecSink::sack_ccx(uint16_t path_id, UecBasePacket::seq_t seqno, UecBasePacket::seq_t acked_psn, bool ce, bool rtx_echo, uint32_t csig_delay_ns) {
+    uint64_t bitmap = buildSackBitmap(seqno);
+    UecAckCcxPacket* pkt =
+        UecAckCcxPacket::newpkt(_flow, NULL, _expected_epsn, seqno, acked_psn, path_id, ce, _recvd_bytes, _rcv_cwnd_pen,
+                                CCX_TYPE_NSCC_CSIG, csig_delay_ns, _srcaddr);
+    pkt->set_bitmap(bitmap);
+    pkt->set_ooo(_out_of_order_count);
+    pkt->set_rtx_echo(rtx_echo);
+    pkt->set_probe_ack(false);
+    return pkt;
+}
+
+UecNackCcxPacket* UecSink::nack_ccx(uint16_t path_id, UecBasePacket::seq_t seqno, bool last_hop, bool ecn_echo, uint32_t csig_delay_ns) {
+    UecNackCcxPacket* pkt = UecNackCcxPacket::newpkt(_flow, NULL, seqno, path_id, _recvd_bytes, _rcv_cwnd_pen,
+                                                      NCCX_TYPE_CSIG, csig_delay_ns, _srcaddr);
     pkt->set_last_hop(last_hop);
     pkt->set_ecn_echo(ecn_echo);
     return pkt;

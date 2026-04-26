@@ -257,6 +257,8 @@ int main(int argc, char **argv) {
             }
             cout << "queue_type "<< qt << endl;
             i++;
+        } else if (!strcmp(argv[i],"-nscc_csig_delay")) {
+            UecSrc::_nscc_csig_enabled = true;
         } else if (!strcmp(argv[i],"-debug")) {
             UecSrc::_debug = true;
             UecPdcSes::_debug = true;

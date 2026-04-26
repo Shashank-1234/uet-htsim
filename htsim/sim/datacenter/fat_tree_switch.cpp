@@ -5,6 +5,7 @@
 #include "callback_pipe.h"
 #include "queue_lossless.h"
 #include "queue_lossless_output.h"
+#include "uecpacket.h"
 
 unordered_map<BaseQueue*,uint32_t> FatTreeSwitch::_port_flow_counts;
 
@@ -411,7 +412,26 @@ Route* FatTreeSwitch::getNextHop(Packet& pkt, BaseQueue* ingress_port){
         
         FibEntry* e = (*available_hops)[ecmp_choice];
         pkt.set_direction(e->getDirection());
-        
+
+        if (pkt.type() == UECDATA) {
+            UecDataPacket* dpkt = dynamic_cast<UecDataPacket*>(&pkt);
+            if (dpkt && dpkt->csig_enabled()) {
+                Route* egress_rt = e->getEgressPort();
+                if (egress_rt && egress_rt->size() > 0) {
+                    BaseQueue* eq = dynamic_cast<BaseQueue*>(egress_rt->at(0));
+                    if (eq) {
+                        // Approximate CSIG delay with current egress queue drain time.
+                        // The packet carries the max value seen along the path.
+                        simtime_picosec local_delay_ps = eq->current_queueing_delay();
+                        uint32_t local_delay_ns = (uint32_t)(local_delay_ps / 1000);
+                        if (local_delay_ns > dpkt->csig_delay_ns()) {
+                            dpkt->set_csig_delay_ns(local_delay_ns);
+                        }
+                    }
+                }
+            }
+        }
+
         return e->getEgressPort();
     }
 
