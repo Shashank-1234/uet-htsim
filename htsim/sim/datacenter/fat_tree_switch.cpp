@@ -6,6 +6,7 @@
 #include "queue_lossless.h"
 #include "queue_lossless_output.h"
 #include "uecpacket.h"
+#include "uec.h"
 
 unordered_map<BaseQueue*,uint32_t> FatTreeSwitch::_port_flow_counts;
 
@@ -415,18 +416,66 @@ Route* FatTreeSwitch::getNextHop(Packet& pkt, BaseQueue* ingress_port){
 
         if (pkt.type() == UECDATA) {
             UecDataPacket* dpkt = dynamic_cast<UecDataPacket*>(&pkt);
-            if (dpkt && dpkt->csig_enabled()) {
+            if (dpkt && (dpkt->csig_enabled() || dpkt->csig_abw_enabled())) {
                 Route* egress_rt = e->getEgressPort();
+                BaseQueue* eq = nullptr;
                 if (egress_rt && egress_rt->size() > 0) {
-                    BaseQueue* eq = dynamic_cast<BaseQueue*>(egress_rt->at(0));
-                    if (eq) {
+                    eq = dynamic_cast<BaseQueue*>(egress_rt->at(0));
+                }
+                if (eq) {
+                    uint32_t local_delay_ns = 0;
+                    uint32_t carried_delay_before = dpkt->csig_delay_ns();
+                    uint32_t carried_delay_after  = carried_delay_before;
+                    bool updated_delay = false;
+                    uint64_t local_abw_bps = 0;
+                    uint32_t local_abw_encoded = CSIG_ABW_INITIAL_MIN_VAL;
+                    uint32_t carried_abw_before = dpkt->csig_abw_encoded();
+                    uint32_t carried_abw_after  = carried_abw_before;
+                    bool updated_abw = false;
+
+                    if (dpkt->csig_enabled()) {
                         // Approximate CSIG delay with current egress queue drain time.
-                        // The packet carries the max value seen along the path.
+                        // Aggregate max
                         simtime_picosec local_delay_ps = eq->current_queueing_delay();
-                        uint32_t local_delay_ns = (uint32_t)(local_delay_ps / 1000);
-                        if (local_delay_ns > dpkt->csig_delay_ns()) {
+                        local_delay_ns = (uint32_t)(local_delay_ps / 1000);
+                        if (local_delay_ns > carried_delay_before) {
                             dpkt->set_csig_delay_ns(local_delay_ns);
+                            carried_delay_after = local_delay_ns;
+                            updated_delay = true;
                         }
+                    }
+                    if (dpkt->csig_abw_enabled()) {
+                        local_abw_bps = eq->current_available_bandwidth_bps();
+                        local_abw_encoded = encode_csig_abw(local_abw_bps);
+                        if (csig_abw_less(local_abw_encoded, carried_abw_before)) {
+                            dpkt->set_csig_abw_encoded(local_abw_encoded);
+                            carried_abw_after = local_abw_encoded;
+                            updated_abw = true;
+                        }
+                    }
+
+                    if (UecSrc::_csig_trace_enabled
+                        && dpkt->flow().flow_id() == UecSrc::_debug_flowid) {
+                        cout << "CSIG_SWITCH"
+                             << " t_us="                 << timeAsUs(eventlist().now())
+                             << " flow="                 << dpkt->flow().flow_id()
+                             << " epsn="                 << dpkt->epsn()
+                             << " pathid="               << dpkt->path_id()
+                             << " pkt_type="             << (int)dpkt->packet_type()
+                             << " switch_id="            << _id
+                             << " switch_type="          << (int)_type
+                             << " direction="            << (int)e->getDirection()
+                             << " egress_queue_size="    << eq->queuesize()
+                             << " local_delay_ns="       << local_delay_ns
+                             << " carried_delay_before_ns=" << carried_delay_before
+                             << " carried_delay_after_ns="  << carried_delay_after
+                             << " local_abw_bps="        << local_abw_bps
+                             << " local_abw_encoded="    << local_abw_encoded
+                             << " carried_abw_before="   << carried_abw_before
+                             << " carried_abw_after="    << carried_abw_after
+                             << " updated_delay="        << (updated_delay ? 1 : 0)
+                             << " updated_abw="          << (updated_abw ? 1 : 0)
+                             << endl;
                     }
                 }
             }

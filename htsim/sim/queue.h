@@ -70,6 +70,9 @@ class BaseQueue  : public EventSource, public PacketSink, public Drawable {
         return (simtime_picosec)(queuesize() * _ps_per_byte);
     }
 
+    // Windowed simulator estimate used as the CSIG min(ABW) source.
+    virtual uint64_t current_available_bandwidth_bps();
+
     static simtime_picosec _update_period;
 
 protected:

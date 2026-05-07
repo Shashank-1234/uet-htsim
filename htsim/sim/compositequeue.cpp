@@ -133,10 +133,14 @@ void CompositeQueue::completeService(){
     }
     
     pkt->flow().logTraffic(*pkt,*this,TrafficLogger::PKT_DEPART);
+
+    // Feed the queue-utilization window used by the CSIG ABW estimator.
+    log_packet_send(drainTime(pkt));
+
     pkt->sendOn();
 
     //_virtual_time += drainTime(pkt);
-  
+
     _serv = QUEUE_INVALID;
   
     if (!_enqueued_high.empty()||!_enqueued_low.empty())

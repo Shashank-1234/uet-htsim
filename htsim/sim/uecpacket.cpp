@@ -8,6 +8,10 @@ PacketDB<UecRtsPacket> UecRtsPacket::_packetdb;
 PacketDB<UecAckCcxPacket> UecAckCcxPacket::_packetdb;
 PacketDB<UecNackCcxPacket> UecNackCcxPacket::_packetdb;
 
+// Set from -linkspeed by main_uec.
+uint64_t g_csig_abw_link_capacity_bps = 100000000000ULL;
+uint64_t g_csig_link_capacity_bps = 100000000000ULL;
+
 UecBasePacket::pull_quanta
 UecBasePacket::quantize_floor(mem_b bytes) {
   return bytes >> UEC_PULL_SHIFT;

@@ -255,6 +255,12 @@ Packet::str() const {
     case UECRTS:
         s = "UECRTS";
         break;
+    case UECACKCCX:
+        s = "UECACKCCX";
+        break;
+    case UECNACKCCX:
+        s = "UECNACKCCX";
+        break;
     }
     return s;
 }

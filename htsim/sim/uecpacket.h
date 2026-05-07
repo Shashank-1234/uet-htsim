@@ -15,6 +15,44 @@
 
 #define VALUE_NOT_SET -1
 
+// Linear 5-bit simulator approximation of CSIG min(ABW).
+#define CSIG_ABW_BUCKETS         32u
+#define CSIG_ABW_INITIAL_MIN_VAL 31u   // all-1b for 5-bit field
+
+extern uint64_t g_csig_abw_link_capacity_bps;
+extern uint64_t g_csig_link_capacity_bps;
+
+inline uint32_t csig_abw_initial_min() {
+    return CSIG_ABW_INITIAL_MIN_VAL;
+}
+
+inline uint32_t encode_csig_abw(uint64_t abw_bps) {
+    const uint64_t cap = g_csig_abw_link_capacity_bps;
+    if (cap == 0) return 0;
+    if (abw_bps >= cap) return CSIG_ABW_BUCKETS - 1;
+    uint64_t bucket = (abw_bps * (uint64_t)CSIG_ABW_BUCKETS) / cap;
+    if (bucket >= CSIG_ABW_BUCKETS) bucket = CSIG_ABW_BUCKETS - 1;
+    return (uint32_t)bucket;
+}
+
+inline uint64_t decode_csig_abw(uint32_t encoded) {
+    if (encoded >= CSIG_ABW_BUCKETS) encoded = CSIG_ABW_BUCKETS - 1;
+    uint64_t bucket_width = g_csig_abw_link_capacity_bps / CSIG_ABW_BUCKETS;
+    return (uint64_t)encoded * bucket_width + bucket_width / 2;
+}
+
+// Keep the all-ones bucket from decoding below line rate.
+inline uint64_t decode_csig_abw_for_scale(uint32_t encoded) {
+    if (encoded >= CSIG_ABW_BUCKETS - 1) {
+        return g_csig_abw_link_capacity_bps;
+    }
+    return decode_csig_abw(encoded);
+}
+
+inline bool csig_abw_less(uint32_t a, uint32_t b) {
+    return a < b;
+}
+
 class UecBasePacket : public Packet {
 public:
     enum PacketType {DATA_PULL = 0, DATA_SPEC = 1, DATA_RTX = 2, DATA_PROBE = 3};    
@@ -72,6 +110,9 @@ public:
         p->_csig_delay_ns = 0;
         p->_csig_reflect_req = false;
 
+        p->_csig_abw_enabled = false;
+        p->_csig_abw_encoded = csig_abw_initial_min();
+
         return p;
     }
   
@@ -124,6 +165,12 @@ public:
     inline bool csig_reflect_req() const {return _csig_reflect_req;}
     inline void set_csig_reflect_req(bool r) {_csig_reflect_req = r;}
 
+    // CSIG min(ABW), carried with CSIG delay in the delay+ABW mode.
+    inline bool csig_abw_enabled() const {return _csig_abw_enabled;}
+    inline void set_csig_abw_enabled(bool e) {_csig_abw_enabled = e;}
+    inline uint32_t csig_abw_encoded() const {return _csig_abw_encoded;}
+    inline void set_csig_abw_encoded(uint32_t v) {_csig_abw_encoded = v;}
+
     virtual PktPriority priority() const {
         if (_is_header) {
             return Packet::PRIO_HI;
@@ -151,6 +198,9 @@ protected:
     bool _csig_enabled;
     uint32_t _csig_delay_ns;
     bool _csig_reflect_req;
+
+    bool _csig_abw_enabled;
+    uint32_t _csig_abw_encoded;  // compact 5-bit bucket index
 
     static PacketDB<UecDataPacket> _packetdb;
 };
@@ -391,6 +441,9 @@ public:
         p->_ccx_type = ccx_type;
         p->_csig_delay_ns = csig_delay_ns;
 
+        p->_csig_abw_valid = false;
+        p->_csig_abw_encoded = csig_abw_initial_min();
+
         // PacketDB recycles packet objects; explicitly reset the fields that
         // setters update later so a freshly issued ACK_CCX never inherits
         // stale state from a previously freed packet.
@@ -426,6 +479,12 @@ public:
     inline uint8_t ccx_type() const {return _ccx_type;}
     inline uint32_t csig_delay_ns() const {return _csig_delay_ns;}
 
+    // _valid separates absent ABW from bucket 0.
+    inline bool csig_abw_valid() const {return _csig_abw_valid;}
+    inline void set_csig_abw_valid(bool v) {_csig_abw_valid = v;}
+    inline uint32_t csig_abw_encoded() const {return _csig_abw_encoded;}
+    inline void set_csig_abw_encoded(uint32_t v) {_csig_abw_encoded = v;}
+
     virtual PktPriority priority() const {return Packet::PRIO_HI;}
     virtual ~UecAckCcxPacket(){}
 
@@ -445,6 +504,9 @@ protected:
 
     uint8_t _ccx_type;
     uint32_t _csig_delay_ns;
+
+    bool _csig_abw_valid;
+    uint32_t _csig_abw_encoded;
 
     static PacketDB<UecAckCcxPacket> _packetdb;
 };
@@ -481,6 +543,9 @@ public:
         p->_nccx_type = nccx_type;
         p->_csig_delay_ns = csig_delay_ns;
 
+        p->_csig_abw_valid = false;
+        p->_csig_abw_encoded = csig_abw_initial_min();
+
         return p;
     }
 
@@ -498,6 +563,11 @@ public:
     inline uint8_t nccx_type() const {return _nccx_type;}
     inline uint32_t csig_delay_ns() const {return _csig_delay_ns;}
 
+    inline bool csig_abw_valid() const {return _csig_abw_valid;}
+    inline void set_csig_abw_valid(bool v) {_csig_abw_valid = v;}
+    inline uint32_t csig_abw_encoded() const {return _csig_abw_encoded;}
+    inline void set_csig_abw_encoded(uint32_t v) {_csig_abw_encoded = v;}
+
     virtual PktPriority priority() const {return Packet::PRIO_HI;}
     virtual ~UecNackCcxPacket(){}
 
@@ -511,6 +581,9 @@ protected:
 
     uint8_t _nccx_type;
     uint32_t _csig_delay_ns;
+
+    bool _csig_abw_valid;
+    uint32_t _csig_abw_encoded;
 
     static PacketDB<UecNackCcxPacket> _packetdb;
 };
