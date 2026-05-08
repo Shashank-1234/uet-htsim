@@ -1130,7 +1130,6 @@ void UecSrc::processAck(const UecAckPacket& pkt) {
     if (_csig_trace_enabled && _flow.flow_id() == _debug_flowid) {
         uint64_t newly_acked_bytes = f.recvd_bytes > prev_recvd_bytes
                                          ? f.recvd_bytes - prev_recvd_bytes : 0;
-        // Keep baseline ACK traces schema-compatible with ACK_CCX traces.
         cout << "CSIG_TRACE"
              << " t_us="                       << timeAsUs(eventlist().now())
              << " flow="                       << _flow.flow_id()
@@ -1140,14 +1139,9 @@ void UecSrc::processAck(const UecAckPacket& pkt) {
              << " in_flight_bytes="            << _in_flight
              << " raw_rtt_us="                 << timeAsUs(raw_rtt)
              << " rtt_delay_us_counterfactual="<< timeAsUs(delay)
-             << " nscc_delay_us_used="         << timeAsUs(delay)
              << " control_delay_us_used="      << timeAsUs(delay)
-             << " control_avg_delay_us="       << timeAsUs(_last_control_avg_delay)
-             << " delay_source=rtt"
-             << " used_csig_delay=0"
              << " ecn_echo="                   << (pkt.ecn_echo() ? 1 : 0)
              << " csig_delay_us="              << 0
-             << " csig_avg_delay_us="          << 0
              << " csig_abw_valid=0"
              << " csig_abw_encoded="           << 0
              << " csig_abw_bps="               << 0
@@ -1159,24 +1153,7 @@ void UecSrc::processAck(const UecAckPacket& pkt) {
              << " nscc_branch="                << (_last_nscc_branch ? _last_nscc_branch : "none")
              << " effective_target_us="        << timeAsUs(_last_effective_target_Qdelay)
              << " target_hop_delay_us="        << timeAsUs(_last_target_hop_delay)
-             << " target_source="              << (_last_target_source ? _last_target_source : "path")
-             << " rate_proxy_bps="             << _last_rate_proxy_bps
              << " control_mode="               << (_last_control_mode ? _last_control_mode : "nscc_legacy")
-             << " poseidon_mpd_us="            << timeAsUs(_last_poseidon_mpd)
-             << " poseidon_mpt_us="            << timeAsUs(_last_poseidon_mpt)
-             << " poseidon_raw_update_ratio="     << _last_poseidon_raw_U
-             << " poseidon_applied_update_ratio=" << _last_poseidon_applied_U
-             << " poseidon_inc_scale="       << 1.0
-             << " poseidon_dec_scale="       << 1.0
-             << " poseidon_rate_proxy_bps="    << _last_rate_proxy_bps
-             << " poseidon_m="                 << _nscc_csig_poseidon_m
-             << " poseidon_mpd_bytes="         << _last_poseidon_mpd_bytes
-             << " poseidon_mpt_bytes="         << _last_poseidon_mpt_bytes
-             << " poseidon_rate_bps="          << _poseidon_rate_bps
-             << " poseidon_rate_before_bps="   << _last_poseidon_rate_before_bps
-             << " poseidon_rate_after_bps="    << _last_poseidon_rate_after_bps
-             << " poseidon_cwnd_pkts="         << _last_poseidon_cwnd_pkts
-             << " poseidon_loss_event="        << (_last_poseidon_loss_event ? _last_poseidon_loss_event : "none")
              << endl;
     }
 }
@@ -1304,7 +1281,6 @@ void UecSrc::poseidon_rate_on_ack(simtime_picosec csig_delay_ps,
         _last_poseidon_applied_U = 1.0;
         _last_poseidon_cwnd_pkts = 1.0;
         _last_control_mode  = "poseidon_rate";
-        _last_target_source = "poseidon";
         _last_nscc_branch   = "poseidon_rate_firstack";
         poseidon_rate_recompute_cwnd();
         return;
@@ -1342,7 +1318,6 @@ void UecSrc::poseidon_rate_on_ack(simtime_picosec csig_delay_ps,
     _last_poseidon_applied_U = applied_U;
     _last_poseidon_cwnd_pkts = cwnd_pkts;
     _last_control_mode       = "poseidon_rate";
-    _last_target_source      = "poseidon";
     if (raw_U > 1.01)       _last_nscc_branch = "poseidon_rate_inc";
     else if (raw_U < 0.99)  _last_nscc_branch = "poseidon_rate_dec";
     else                    _last_nscc_branch = "poseidon_rate_hold";
@@ -1370,7 +1345,6 @@ bool UecSrc::csig_delay_abw_on_ack(bool skip,
             : _target_Qdelay;
     _last_target_hop_delay = t_hop;
     _last_effective_target_Qdelay = t_hop;
-    _last_target_source = "csig_delay_abw";
     _last_control_mode  = "csig_delay_abw";
 
     if (csig_delay_ps > t_hop) {
@@ -1663,7 +1637,6 @@ void UecSrc::updateCwndOnAck_NSCC(bool skip, simtime_picosec delay, mem_b newly_
     _last_control_mode = "nscc_legacy";
     _last_poseidon_loss_event = "none";
     const simtime_picosec memory_delay = delay;
-    _last_control_avg_delay = memory_delay;
 
     if (_nscc_csig_poseidon_rate_enabled && _nscc_csig_enabled) {
         poseidon_rate_on_ack(delay, _raw_rtt, newly_acked_bytes);
@@ -1680,8 +1653,6 @@ void UecSrc::updateCwndOnAck_NSCC(bool skip, simtime_picosec delay, mem_b newly_
 
     simtime_picosec effective_target = _target_Qdelay;
     double effective_qa_threshold = _qa_threshold;
-    _last_target_source = "path";
-    _last_rate_proxy_bps = 0;
     _last_effective_target_Qdelay = effective_target;
 
     if (quick_adapt(false, skip, memory_delay, effective_qa_threshold)) {
@@ -2058,14 +2029,9 @@ void UecSrc::processAckCcx(const UecAckCcxPacket& pkt) {
     // Capture pre-override delay so the trace can show what RTT-derived
     // delay would have been used in baseline mode (counterfactual).
     simtime_picosec rtt_delay_before_override = delay;
-    bool used_csig_delay = false;
-    _last_delay_source = "rtt";
-
     if (_nscc_csig_enabled || _nscc_csig_delay_abw_enabled) {
         // Poseidon-rate and delay+ABW use reflected max-hop delay.
         delay = (simtime_picosec)pkt.csig_delay_ns() * 1000;
-        used_csig_delay = true;
-        _last_delay_source = "csig";
     }
 
     _last_abw_budget_bytes = 0;
@@ -2133,14 +2099,9 @@ void UecSrc::processAckCcx(const UecAckCcxPacket& pkt) {
              << " in_flight_bytes="            << _in_flight
              << " raw_rtt_us="                 << timeAsUs(raw_rtt)
              << " rtt_delay_us_counterfactual="<< timeAsUs(rtt_delay_before_override)
-             << " nscc_delay_us_used="         << timeAsUs(delay)
              << " control_delay_us_used="      << timeAsUs(delay)
-             << " control_avg_delay_us="       << timeAsUs(_last_control_avg_delay)
-             << " delay_source="               << (_last_delay_source ? _last_delay_source : "rtt")
-             << " used_csig_delay="            << (used_csig_delay ? 1 : 0)
              << " ecn_echo="                   << (pkt.ecn_echo() ? 1 : 0)
              << " csig_delay_us="              << csig_delay_us
-             << " csig_avg_delay_us="          << 0
              << " csig_abw_valid="             << (pkt.csig_abw_valid() ? 1 : 0)
              << " csig_abw_encoded="           << abw_encoded
              << " csig_abw_bps="               << abw_bps
@@ -2152,25 +2113,23 @@ void UecSrc::processAckCcx(const UecAckCcxPacket& pkt) {
              << " nscc_branch="                << (_last_nscc_branch ? _last_nscc_branch : "none")
              << " effective_target_us="        << timeAsUs(_last_effective_target_Qdelay)
              << " target_hop_delay_us="        << timeAsUs(_last_target_hop_delay)
-             << " target_source="              << (_last_target_source ? _last_target_source : "path")
-             << " rate_proxy_bps="             << _last_rate_proxy_bps
-             << " control_mode="               << (_last_control_mode ? _last_control_mode : "nscc_legacy")
-             << " poseidon_mpd_us="            << timeAsUs(_last_poseidon_mpd)
-             << " poseidon_mpt_us="            << timeAsUs(_last_poseidon_mpt)
-             << " poseidon_raw_update_ratio="     << _last_poseidon_raw_U
-             << " poseidon_applied_update_ratio=" << _last_poseidon_applied_U
-             << " poseidon_inc_scale="       << 1.0
-             << " poseidon_dec_scale="       << 1.0
-             << " poseidon_rate_proxy_bps="    << _last_rate_proxy_bps
-             << " poseidon_m="                 << _nscc_csig_poseidon_m
-             << " poseidon_mpd_bytes="         << _last_poseidon_mpd_bytes
-             << " poseidon_mpt_bytes="         << _last_poseidon_mpt_bytes
-             << " poseidon_rate_bps="          << _poseidon_rate_bps
-             << " poseidon_rate_before_bps="   << _last_poseidon_rate_before_bps
-             << " poseidon_rate_after_bps="    << _last_poseidon_rate_after_bps
-             << " poseidon_cwnd_pkts="         << _last_poseidon_cwnd_pkts
-             << " poseidon_loss_event="        << (_last_poseidon_loss_event ? _last_poseidon_loss_event : "none")
-             << endl;
+             << " control_mode="               << (_last_control_mode ? _last_control_mode : "nscc_legacy");
+
+        if (_nscc_csig_poseidon_rate_enabled) {
+            cout << " poseidon_mpd_us="            << timeAsUs(_last_poseidon_mpd)
+                 << " poseidon_mpt_us="            << timeAsUs(_last_poseidon_mpt)
+                 << " poseidon_raw_update_ratio="     << _last_poseidon_raw_U
+                 << " poseidon_applied_update_ratio=" << _last_poseidon_applied_U
+                 << " poseidon_m="                 << _nscc_csig_poseidon_m
+                 << " poseidon_mpd_bytes="         << _last_poseidon_mpd_bytes
+                 << " poseidon_mpt_bytes="         << _last_poseidon_mpt_bytes
+                 << " poseidon_rate_bps="          << _poseidon_rate_bps
+                 << " poseidon_rate_before_bps="   << _last_poseidon_rate_before_bps
+                 << " poseidon_rate_after_bps="    << _last_poseidon_rate_after_bps
+                 << " poseidon_cwnd_pkts="         << _last_poseidon_cwnd_pkts
+                 << " poseidon_loss_event="        << (_last_poseidon_loss_event ? _last_poseidon_loss_event : "none");
+        }
+        cout << endl;
     }
 }
 
@@ -2240,7 +2199,6 @@ void UecSrc::processNackCcx(const UecNackCcxPacket& pkt) {
             ? (simtime_picosec)(_last_poseidon_mpt_bytes * 8.0 * 1e12 / link_bps)
             : 0;
         _last_effective_target_Qdelay = _last_poseidon_mpt;
-        _last_target_source = "poseidon";
         _last_control_mode = "poseidon_rate";
 
         const simtime_picosec rtt_delay = (raw_rtt >= _base_rtt)
@@ -2254,14 +2212,9 @@ void UecSrc::processNackCcx(const UecNackCcxPacket& pkt) {
              << " in_flight_bytes="            << _in_flight
              << " raw_rtt_us="                 << timeAsUs(raw_rtt)
              << " rtt_delay_us_counterfactual="<< timeAsUs(rtt_delay)
-             << " nscc_delay_us_used="         << timeAsUs(csig_delay_ps)
              << " control_delay_us_used="      << timeAsUs(csig_delay_ps)
-             << " control_avg_delay_us="       << timeAsUs(_last_control_avg_delay)
-             << " delay_source=csig"
-             << " used_csig_delay=1"
              << " ecn_echo="                   << (pkt.ecn_echo() ? 1 : 0)
              << " csig_delay_us="              << ((double)pkt.csig_delay_ns() / 1000.0)
-             << " csig_avg_delay_us="          << 0
              << " csig_abw_valid=0"
              << " csig_abw_encoded=0"
              << " csig_abw_bps=0"
@@ -2272,16 +2225,11 @@ void UecSrc::processNackCcx(const UecNackCcxPacket& pkt) {
              << " newly_acked_bytes=0"
              << " nscc_branch="                << (_last_nscc_branch ? _last_nscc_branch : "none")
              << " effective_target_us="        << timeAsUs(_last_effective_target_Qdelay)
-             << " target_source="              << (_last_target_source ? _last_target_source : "poseidon")
-             << " rate_proxy_bps="             << _last_rate_proxy_bps
              << " control_mode="               << (_last_control_mode ? _last_control_mode : "poseidon_rate")
              << " poseidon_mpd_us="            << timeAsUs(_last_poseidon_mpd)
              << " poseidon_mpt_us="            << timeAsUs(_last_poseidon_mpt)
              << " poseidon_raw_update_ratio="     << _last_poseidon_raw_U
              << " poseidon_applied_update_ratio=" << _last_poseidon_applied_U
-             << " poseidon_inc_scale="       << 1.0
-             << " poseidon_dec_scale="       << 1.0
-             << " poseidon_rate_proxy_bps="    << _last_rate_proxy_bps
              << " poseidon_m="                 << _nscc_csig_poseidon_m
              << " poseidon_mpd_bytes="         << _last_poseidon_mpd_bytes
              << " poseidon_mpt_bytes="         << _last_poseidon_mpt_bytes

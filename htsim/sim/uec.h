@@ -478,14 +478,10 @@ private:
 
     const char* _last_nscc_branch = "none";
 
-    const char* _last_delay_source = "rtt";
     mem_b _last_abw_budget_bytes = 0;
     mem_b _last_abw_delta_bytes  = 0;
     simtime_picosec _last_target_hop_delay = 0;
     simtime_picosec _last_effective_target_Qdelay = 0;
-    const char* _last_target_source = "path";
-    uint64_t _last_rate_proxy_bps = 0;
-    simtime_picosec _last_control_avg_delay = 0;
     const char* _last_control_mode = "nscc_legacy";
     simtime_picosec _last_poseidon_mpd = 0;
     simtime_picosec _last_poseidon_mpt = 0;
