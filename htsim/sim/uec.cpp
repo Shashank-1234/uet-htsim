@@ -36,6 +36,20 @@ uint16_t UecSink::_mtus_per_pull = 4;
 UecBasePacket::pull_quanta UecSink::_credit_per_pull = (UecSrc::_mss * UecSink::_mtus_per_pull) >> UEC_PULL_SHIFT;
 
 bool UecSrc::_debug = false;
+bool UecSrc::_nscc_csig_enabled = false;
+bool UecSrc::_csig_trace_enabled = false;
+double UecSrc::_nscc_csig_poseidon_m = 0.25;
+bool UecSrc::_nscc_csig_poseidon_rate_enabled = false;
+double UecSrc::_poseidon_p_bytes = 525000.0;
+double UecSrc::_poseidon_k_bytes = 25000.0;
+uint64_t UecSrc::_poseidon_min_rate_bps  = 0;  // 0 => resolved post-CLI
+uint64_t UecSrc::_poseidon_max_rate_bps  = 0;  // 0 => resolved post-CLI
+uint64_t UecSrc::_poseidon_init_rate_bps = 0;  // 0 => resolved post-CLI
+
+bool UecSrc::_nscc_csig_delay_abw_enabled = false;
+double UecSrc::_csig_delay_abw_target_divisor = 3.0;
+double UecSrc::_csig_delay_abw_gain = 0.0625;
+double UecSrc::_csig_delay_abw_low_frac = 0.5;
 
 bool UecSrc::_sender_based_cc = false;
 bool UecSrc::_receiver_based_cc = false;
@@ -649,6 +663,16 @@ void UecSrc::receivePacket(Packet& pkt, uint32_t portnum) {
             pkt.free();
             return;
         }
+        case UECACKCCX: {
+            processAckCcx((const UecAckCcxPacket&)pkt);
+            pkt.free();
+            return;
+        }
+        case UECNACKCCX: {
+            processNackCcx((const UecNackCcxPacket&)pkt);
+            pkt.free();
+            return;
+        }
         default: {
             cout << "UecSrc::receivePacket receive default\n";
 
@@ -831,9 +855,9 @@ bool UecSrc::checkFinished(UecDataPacket::seq_t cum_ack) {
                     << " prop_inc " << _nscc_overall_stats.inc_prop_bytes
                     << " fast_inc " << _nscc_overall_stats.inc_fast_bytes 
                     << " eta_inc " << _nscc_overall_stats.inc_eta_bytes 
-                    << " multi_dec -" << _nscc_overall_stats.dec_multi_bytes 
-                    << " quick_dec -" << _nscc_overall_stats.dec_quick_bytes 
-                    << " nack_dec -" << _nscc_overall_stats.dec_nack_bytes 
+                    << " multi_dec -" << _nscc_overall_stats.dec_multi_bytes
+                    << " quick_dec -" << _nscc_overall_stats.dec_quick_bytes
+                    << " nack_dec -" << _nscc_overall_stats.dec_nack_bytes
                     << endl;
                 cancelRTO();
                 _done_sending = true;
@@ -851,9 +875,9 @@ bool UecSrc::checkFinished(UecDataPacket::seq_t cum_ack) {
                     << " prop_inc " << _nscc_overall_stats.inc_prop_bytes
                     << " fast_inc " << _nscc_overall_stats.inc_fast_bytes 
                     << " eta_inc " << _nscc_overall_stats.inc_eta_bytes 
-                    << " multi_dec -" << _nscc_overall_stats.dec_multi_bytes 
-                    << " quick_dec -" << _nscc_overall_stats.dec_quick_bytes 
-                    << " nack_dec -" << _nscc_overall_stats.dec_nack_bytes 
+                    << " multi_dec -" << _nscc_overall_stats.dec_multi_bytes
+                    << " quick_dec -" << _nscc_overall_stats.dec_quick_bytes
+                    << " nack_dec -" << _nscc_overall_stats.dec_nack_bytes
                     << endl;
                 _speculating = false;
                 if (_end_trigger) {
@@ -901,117 +925,32 @@ bool UecSrc::validateSendTs(UecBasePacket::seq_t acked_psn, bool rtx_echo) {
     }
 }
 
-void UecSrc::processAck(const UecAckPacket& pkt) {
-    _nic.logReceivedCtrl(pkt.size());
-    
-    auto cum_ack = pkt.cumulative_ack();
-    bool rtx_echo = pkt.rtx_echo();
-    //handle flight_size based on recvd_bytes in packet.
-    uint64_t newly_recvd_bytes = 0;
-
-    if (pkt.recvd_bytes() > _recvd_bytes){
-        newly_recvd_bytes = pkt.recvd_bytes() - _recvd_bytes;
-        _recvd_bytes = pkt.recvd_bytes();
-
+void UecSrc::processAckCommon(const AckFields& f, simtime_picosec delay,
+                              simtime_picosec raw_rtt, simtime_picosec send_time,
+                              mem_b pkt_size) {
+    uint64_t newly_recvd_bytes = f.recvd_bytes > _recvd_bytes ? f.recvd_bytes - _recvd_bytes : 0;
+    if (newly_recvd_bytes > 0) {
+        _recvd_bytes = f.recvd_bytes;
         _achieved_bytes += newly_recvd_bytes;
         _received_bytes += newly_recvd_bytes;
         _bytes_ignored += newly_recvd_bytes;
     }
 
-    if (_debug_src) {
-        cout << "processAck " << cum_ack << " ref_epsn " << pkt.acked_psn() << " recvd_bytes " << _recvd_bytes << " newly_recvd_bytes " << newly_recvd_bytes << endl;
-    }
     _stats.acks_received++;
-
-    //decrease flightsize.
     _in_flight -= newly_recvd_bytes;
-    // We cannot run this next line's check here since 
-    // _in_flight could be corrected (increased) in either
-    // handleCumulativeAck or handleAckno.
-    // assert(_in_flight >= 0);
 
-    if (_sender_based_cc && pkt.rcv_wnd_pen() < 255) {
-            sint64_t window_decrease = newly_recvd_bytes - newly_recvd_bytes * pkt.rcv_wnd_pen() / 255;
+    if (_sender_based_cc && f.rcv_wnd_pen < 255) {
+            sint64_t window_decrease = newly_recvd_bytes - newly_recvd_bytes * f.rcv_wnd_pen / 255;
             _cwnd = max(_cwnd-window_decrease, (mem_b)_mtu);
     }
 
-    //compute RTT sample
-    auto acked_psn = pkt.acked_psn();
-    auto i = _tx_bitmap.find(acked_psn);
-    auto rtx_time = _rtx_times.find(acked_psn);
-    uint32_t ooo = pkt.ooo();
-
-    mem_b pkt_size;
-    simtime_picosec delay;
-    simtime_picosec raw_rtt = 0;
-    simtime_picosec send_time = 0;
-
-    if (i != _tx_bitmap.end() && validateSendTs(acked_psn, pkt.rtx_echo()) && (!pkt.is_probe_ack()) ) {
-    //a timestamp is valid if 
-    //1. the received ack is new packet and no retransmission at local record;
-    //or 2. the received ack is a retransmitted packet and local record shows this packet only gets retransmitted once. 
-        if(_flow.flow_id() == _debug_flowid ){
-            cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id() 
-                << " rtx_times "<< rtx_time->second
-                << " rtx_echo " << rtx_echo 
-                << " packet_type " << pkt.is_probe_ack()
-                << " _probe_psn " << _probe_seqno
-                << " psn " << pkt.acked_psn()
-                << endl;
-        }
-        //auto seqno = i->first;
-        send_time = i->second.send_time;
-        pkt_size = i->second.pkt_size;
-        raw_rtt = eventlist().now() - send_time;
-
-        if (!pkt.is_rts()) {
-            update_base_rtt(raw_rtt);
-        }
-        
-        if (raw_rtt >= _base_rtt) {
-            update_delay(raw_rtt, true, pkt.ecn_echo());
-            delay = raw_rtt - _base_rtt; 
-        } else {
-            delay = get_avg_delay();
-        }
-    } else {
-        // this can happen when the ACK arrives later than a cumulative ACK covering the NACKed
-        // packet.
-        if (UecSrc::_debug)
-            cout << "Can't find send record for seqno " << acked_psn << endl;
-        if (pkt.is_probe_ack()){
-            if (_probe_seqno == pkt.acked_psn()){
-                _raw_rtt = eventlist().now() - _probe_send_time ;
-                if (_raw_rtt < _base_rtt){
-                    delay = 0;
-                    _raw_rtt = _base_rtt;
-                }else{
-                    delay = _raw_rtt - _base_rtt;
-                    update_delay(_raw_rtt, true, pkt.ecn_echo());
-                }
-                if(_flow.flow_id() == _debug_flowid ){
-                    cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id() << " _probe_seqno " << _probe_seqno
-                        << " delay " << timeAsUs(delay) 
-                        << endl;
-                }
-            }else{
-                delay = get_avg_delay();
-            }
-            pkt_size = 0;
-        }else{
-            pkt_size = _mtu;
-            delay = get_avg_delay();
-        }
-    }
-
-    handleCumulativeAck(cum_ack);
+    handleCumulativeAck(f.cum_ack);
 
     if (_debug_src)
-        cout << "At " << timeAsUs(eventlist().now()) << " " << _flow.str() << " " << _nodename << " processAck cum_ack: " << cum_ack << " flow " << _flow.str() << endl;
+        cout << "At " << timeAsUs(eventlist().now()) << " " << _flow.str() << " " << _nodename << " processAck cum_ack: " << f.cum_ack << " flow " << _flow.str() << endl;
 
-    auto ackno = pkt.ref_ack();
-
-    uint64_t bitmap = pkt.bitmap();
+    auto ackno = f.ref_ack;
+    uint64_t bitmap = f.bitmap;
 
     if (_debug_src)
         cout << "    ref_ack: " << ackno << " bitmap: " << bitmap << endl;
@@ -1030,82 +969,198 @@ void UecSrc::processAck(const UecAckPacket& pkt) {
         bitmap >>= 1;
     }
 
-    // We ran both potential _in_flight correcting functions
-    // now check if we are in the negative.
-    //assert(_in_flight >= 0);
-
-
-    _mp->processEv(pkt.ev(), pkt.ecn_echo() ? UecMultipath::PATH_ECN : UecMultipath::PATH_GOOD);
+    _mp->processEv(f.ev, f.ecn_echo ? UecMultipath::PATH_ECN : UecMultipath::PATH_GOOD);
 
     if(_flow.flow_id() == _debug_flowid ){
         cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id() << " track_avg_rtt " << timeAsUs(get_avg_delay())
-            << " rtt " << timeAsUs(raw_rtt) << " skip " << pkt.ecn_echo()  << " ev " << pkt.ev()
-            << " cum_ack " << cum_ack
-            << " bitmap_base " << pkt.ref_ack()
-            << " ooo " << ooo
+            << " rtt " << timeAsUs(raw_rtt) << " skip " << f.ecn_echo  << " ev " << f.ev
+            << " cum_ack " << f.cum_ack
+            << " bitmap_base " << f.ref_ack
+            << " ooo " << f.ooo
             << " cwnd " << _cwnd/get_avg_pktsize()
             << " _achieved_bytes " << _achieved_bytes
-            << " acked_psn " << acked_psn
+            << " acked_psn " << f.acked_psn
             << " sending_time " << timeAsUs(send_time)
             << endl;
     }
     if (_sender_based_cc){
-        /*if (pkt.ecn_echo()){
-            (this->*updateCwndOnAck)(pkt.ecn_echo(), delay, pkt_size);
-            (this->*updateCwndOnAck)(false, delay, newly_recvd_bytes - pkt_size);
-        }
-        else */
-        (this->*updateCwndOnAck)(pkt.ecn_echo(), delay, newly_recvd_bytes);
+        if (raw_rtt > 0) _raw_rtt = raw_rtt;
+        (this->*updateCwndOnAck)(f.ecn_echo, delay, newly_recvd_bytes);
     }
 
     if (_debug_src) {
-        cout << "At " << timeAsUs(eventlist().now()) << " " << _flow.str() << " " << _nodename << " processAck: " << cum_ack << " flow " << _flow.str() << " cwnd " << _cwnd << " flightsize " << _in_flight << " delay " << timeAsUs(delay) << " newlyrecvd " << newly_recvd_bytes << " skip " << pkt.ecn_echo() << " raw rtt " << raw_rtt << endl;
+        cout << "At " << timeAsUs(eventlist().now()) << " " << _flow.str() << " " << _nodename << " processAck: " << f.cum_ack << " flow " << _flow.str() << " cwnd " << _cwnd << " flightsize " << _in_flight << " delay " << timeAsUs(delay) << " newlyrecvd " << newly_recvd_bytes << " skip " << f.ecn_echo << " raw rtt " << raw_rtt << endl;
     }
 
     if (_sender_based_cc && _enable_sleek) {
-        //probe packets
         if (_probe_timer_when != 0){
             if (_probe_timer_handle->second != this){
                 if(_flow.flow_id() == _debug_flowid ){
                     cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id() << " an assert soon"<< endl;
-                }                
+                }
             }
             eventlist().cancelPendingSourceByHandle(*this, _probe_timer_handle);
             _probe_timer_when = 0;
             _probe_timer_handle = eventlist().nullHandle();
         }
-        if (cum_ack < _highest_sent || _backlog > 0){
+        if (f.cum_ack < _highest_sent || _backlog > 0){
             if (_backlog == 0){
-                _probe_timer_when = eventlist().now() + (_base_rtt+_target_Qdelay);            
+                _probe_timer_when = eventlist().now() + (_base_rtt+_target_Qdelay);
             }else{
                 _probe_timer_when = eventlist().now() + probe_first_trial_time*_base_rtt;
             }
             _probe_timer_handle = eventlist().sourceIsPendingGetHandle(*this, _probe_timer_when);
         }
-        if(pkt.is_probe_ack() && delay < _target_Qdelay){
+        if(f.is_probe_ack && delay < _target_Qdelay){
             _loss_recovery_mode = true;
             _recovery_seqno = _highest_sent;
-            _highest_rtx_sent = cum_ack;
+            _highest_rtx_sent = f.cum_ack;
             if(_flow.flow_id() == _debug_flowid ){
                 cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id() << " enter_loss_probe " << " _avg_delay " << timeAsUs(_avg_delay)<< endl;
             }
         }
-        runSleek(ooo, cum_ack);
+        runSleek(f.ooo, f.cum_ack);
     }
 
     stopSpeculating();
 
-    if (checkFinished(cum_ack)) {
+    if (checkFinished(f.cum_ack)) {
         return;
     }
 
     sendIfPermitted();
 }
 
+void UecSrc::processAck(const UecAckPacket& pkt) {
+    _nic.logReceivedCtrl(pkt.size());
+
+    auto acked_psn = pkt.acked_psn();
+    auto i = _tx_bitmap.find(acked_psn);
+    auto rtx_time = _rtx_times.find(acked_psn);
+    bool rtx_echo = pkt.rtx_echo();
+
+    mem_b pkt_size;
+    simtime_picosec delay;
+    simtime_picosec raw_rtt = 0;
+    simtime_picosec send_time = 0;
+
+    if (i != _tx_bitmap.end() && validateSendTs(acked_psn, pkt.rtx_echo()) && (!pkt.is_probe_ack()) ) {
+        if(_flow.flow_id() == _debug_flowid ){
+            cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id()
+                << " rtx_times "<< rtx_time->second
+                << " rtx_echo " << rtx_echo
+                << " packet_type " << pkt.is_probe_ack()
+                << " _probe_psn " << _probe_seqno
+                << " psn " << pkt.acked_psn()
+                << endl;
+        }
+        send_time = i->second.send_time;
+        pkt_size = i->second.pkt_size;
+        raw_rtt = eventlist().now() - send_time;
+
+        if (!pkt.is_rts()) {
+            update_base_rtt(raw_rtt);
+        }
+
+        if (raw_rtt >= _base_rtt) {
+            update_delay(raw_rtt, true, pkt.ecn_echo());
+            delay = raw_rtt - _base_rtt;
+        } else {
+            delay = get_avg_delay();
+        }
+    } else {
+        if (UecSrc::_debug)
+            cout << "Can't find send record for seqno " << acked_psn << endl;
+        if (pkt.is_probe_ack()){
+            if (_probe_seqno == pkt.acked_psn()){
+                _raw_rtt = eventlist().now() - _probe_send_time ;
+                if (_raw_rtt < _base_rtt){
+                    delay = 0;
+                    _raw_rtt = _base_rtt;
+                }else{
+                    delay = _raw_rtt - _base_rtt;
+                    update_delay(_raw_rtt, true, pkt.ecn_echo());
+                }
+                if(_flow.flow_id() == _debug_flowid ){
+                    cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id() << " _probe_seqno " << _probe_seqno
+                        << " delay " << timeAsUs(delay)
+                        << endl;
+                }
+            }else{
+                delay = get_avg_delay();
+            }
+            pkt_size = 0;
+        }else{
+            pkt_size = _mtu;
+            delay = get_avg_delay();
+        }
+    }
+
+    AckFields f;
+    f.cum_ack = pkt.cumulative_ack();
+    f.acked_psn = acked_psn;
+    f.ref_ack = pkt.ref_ack();
+    f.bitmap = pkt.bitmap();
+    f.recvd_bytes = pkt.recvd_bytes();
+    f.rcv_wnd_pen = pkt.rcv_wnd_pen();
+    f.ev = pkt.ev();
+    f.ooo = pkt.ooo();
+    f.ecn_echo = pkt.ecn_echo();
+    f.rtx_echo = pkt.rtx_echo();
+    f.is_rts = pkt.is_rts();
+    f.is_probe_ack = pkt.is_probe_ack();
+
+    mem_b cwnd_before = _cwnd;
+    uint64_t prev_recvd_bytes = _recvd_bytes;
+    processAckCommon(f, delay, raw_rtt, send_time, pkt_size);
+
+    if (_csig_trace_enabled) {
+        // Lightweight per-flow throughput sample for offline fairness.
+        uint64_t nb = f.recvd_bytes > prev_recvd_bytes
+                          ? f.recvd_bytes - prev_recvd_bytes : 0;
+        if (nb > 0) {
+            cout << "CSIG_FLOW"
+                 << " t_us="              << timeAsUs(eventlist().now())
+                 << " flow="              << _flow.flow_id()
+                 << " newly_acked_bytes=" << nb
+                 << "\n";
+        }
+    }
+
+    if (_csig_trace_enabled && _flow.flow_id() == _debug_flowid) {
+        uint64_t newly_acked_bytes = f.recvd_bytes > prev_recvd_bytes
+                                         ? f.recvd_bytes - prev_recvd_bytes : 0;
+        cout << "CSIG_TRACE"
+             << " t_us="                       << timeAsUs(eventlist().now())
+             << " flow="                       << _flow.flow_id()
+             << " ack_type=ACK"
+             << " cwnd_before_bytes="          << cwnd_before
+             << " cwnd_after_bytes="           << _cwnd
+             << " in_flight_bytes="            << _in_flight
+             << " raw_rtt_us="                 << timeAsUs(raw_rtt)
+             << " rtt_delay_us_counterfactual="<< timeAsUs(delay)
+             << " control_delay_us_used="      << timeAsUs(delay)
+             << " ecn_echo="                   << (pkt.ecn_echo() ? 1 : 0)
+             << " csig_delay_us="              << 0
+             << " csig_abw_valid=0"
+             << " csig_abw_encoded="           << 0
+             << " csig_abw_bps="               << 0
+             << " abw_fraction="               << 1.0
+             << " abw_budget_bytes="           << 0
+             << " abw_delta_bytes="            << 0
+             << " acked_psn="                  << acked_psn
+             << " newly_acked_bytes="          << newly_acked_bytes
+             << " nscc_branch="                << (_last_nscc_branch ? _last_nscc_branch : "none")
+             << " effective_target_us="        << timeAsUs(_last_effective_target_Qdelay)
+             << " target_hop_delay_us="        << timeAsUs(_last_target_hop_delay)
+             << " control_mode="               << (_last_control_mode ? _last_control_mode : "nscc_legacy")
+             << endl;
+    }
+}
+
 void UecSrc::updateCwndOnAck_DCTCP(bool skip, simtime_picosec rtt, mem_b newly_acked_bytes) {
     cout << timeAsUs(eventlist().now()) << " DCTCP start " << _name << " cwnd " << _cwnd
-         << " with params skip " << skip << " acked bytes " << newly_acked_bytes << endl;
-
+        << " with params skip " << skip << " acked bytes " << newly_acked_bytes << endl;
     if (skip == false)  // additive increase, 1 PKT /RTT
     {
         _cwnd += newly_acked_bytes * _mtu / _cwnd;
@@ -1142,7 +1197,255 @@ void UecSrc::set_cwnd_bounds() {
         _cwnd = _maxwnd;
 }
 
-bool UecSrc::quick_adapt(bool is_loss, bool skip, simtime_picosec delay) {
+// Poseidon byte-domain target for the current rate.
+double UecSrc::poseidon_rate_mpt_bytes(uint64_t rate_bps) const {
+    const double rmax = (double)_poseidon_max_rate_bps;
+    const double rmin = (double)_poseidon_min_rate_bps;
+    const double r    = (double)rate_bps;
+    if (rmax <= 0.0 || rmin <= 0.0 || r <= 0.0 || rmax <= rmin) {
+        return _poseidon_k_bytes;
+    }
+    double clamped_r = r;
+    if (clamped_r < rmin) clamped_r = rmin;
+    if (clamped_r > rmax) clamped_r = rmax;
+    const double spread = log(rmax) - log(rmin);
+    const double num    = log(rmax) - log(clamped_r);
+    return _poseidon_p_bytes * (num / spread) + _poseidon_k_bytes;
+}
+
+double UecSrc::poseidon_rate_update_ratio_bytes(double mpd_bytes,
+                                                 double mpt_bytes) const {
+    const double rmax = (double)_poseidon_max_rate_bps;
+    const double rmin = (double)_poseidon_min_rate_bps;
+    if (rmax <= 0.0 || rmin <= 0.0 || rmax <= rmin || _poseidon_p_bytes <= 0.0) {
+        return 1.0;
+    }
+    const double spread = log(rmax) - log(rmin);
+    const double exponent = ((mpt_bytes - mpd_bytes) / _poseidon_p_bytes)
+                          * spread * _nscc_csig_poseidon_m;
+    return exp(exponent);
+}
+
+void UecSrc::poseidon_rate_init_if_needed() {
+    if (_poseidon_rate_bps == 0) {
+        _poseidon_rate_bps = (_poseidon_init_rate_bps > 0)
+                                 ? _poseidon_init_rate_bps
+                                 : (_poseidon_max_rate_bps > 0
+                                        ? _poseidon_max_rate_bps
+                                        : (uint64_t)_nic.linkspeed());
+    }
+    if (_poseidon_max_rate_bps > 0 && _poseidon_rate_bps > _poseidon_max_rate_bps) {
+        _poseidon_rate_bps = _poseidon_max_rate_bps;
+    }
+    if (_poseidon_min_rate_bps > 0 && _poseidon_rate_bps < _poseidon_min_rate_bps) {
+        _poseidon_rate_bps = _poseidon_min_rate_bps;
+    }
+}
+
+void UecSrc::poseidon_rate_recompute_cwnd() {
+    if (_base_rtt == 0 || _poseidon_rate_bps == 0) return;
+    const double base_rtt_s = (double)_base_rtt / 1e12;
+    double cwnd_d = (double)_poseidon_rate_bps * base_rtt_s / 8.0;
+    if (cwnd_d < (double)_min_cwnd) cwnd_d = (double)_min_cwnd;
+    if (cwnd_d > (double)_maxwnd)   cwnd_d = (double)_maxwnd;
+    _cwnd = (mem_b)cwnd_d;
+}
+
+void UecSrc::poseidon_rate_on_ack(simtime_picosec csig_delay_ps,
+                                   simtime_picosec raw_rtt,
+                                   mem_b newly_acked_bytes) {
+    poseidon_rate_init_if_needed();
+    const uint64_t rate_before = _poseidon_rate_bps;
+    _last_poseidon_rate_before_bps = rate_before;
+    _last_poseidon_loss_event      = "none";
+
+    const double link_bps = (double)g_csig_link_capacity_bps;
+    const double mpd_bytes = (link_bps > 0.0)
+        ? ((double)csig_delay_ps * link_bps / (8.0 * 1e12))
+        : 0.0;
+    const double mpt_bytes = poseidon_rate_mpt_bytes(rate_before);
+    const simtime_picosec mpt_delay_ps = (link_bps > 0.0)
+        ? (simtime_picosec)(mpt_bytes * 8.0 * 1e12 / link_bps)
+        : 0;
+
+    // First ACK seeds the reflected INT state but does not change rate.
+    if (_poseidon_first_ack) {
+        _poseidon_first_ack = false;
+        _last_poseidon_mpd_bytes = mpd_bytes;
+        _last_poseidon_mpt_bytes = mpt_bytes;
+        _last_poseidon_rate_after_bps = rate_before;
+        _last_poseidon_mpd = csig_delay_ps;
+        _last_poseidon_mpt = mpt_delay_ps;
+        _last_effective_target_Qdelay = mpt_delay_ps;
+        _last_poseidon_raw_U     = 1.0;
+        _last_poseidon_applied_U = 1.0;
+        _last_poseidon_cwnd_pkts = 1.0;
+        _last_control_mode  = "poseidon_rate";
+        _last_nscc_branch   = "poseidon_rate_firstack";
+        poseidon_rate_recompute_cwnd();
+        return;
+    }
+
+    // cwnd_pkts = RTT / tx_time(last packet) at the current rate.
+    double cwnd_pkts = 1.0;
+    if (raw_rtt > 0 && _poseidon_last_pkt_size > 0 && rate_before > 0) {
+        const double tx_time_s = ((double)_poseidon_last_pkt_size * 8.0)
+                                 / (double)rate_before;
+        const double rtt_s = (double)raw_rtt / 1e12;
+        if (tx_time_s > 0.0) {
+            cwnd_pkts = rtt_s / tx_time_s;
+            if (cwnd_pkts < 1.0) cwnd_pkts = 1.0;
+        }
+    }
+
+    double raw_U = poseidon_rate_update_ratio_bytes(mpd_bytes, mpt_bytes);
+    if (raw_U < 0.4) raw_U = 0.4;
+    if (raw_U > 2.5) raw_U = 2.5;
+    const double applied_U = 1.0 + (raw_U - 1.0) / cwnd_pkts;
+
+    double new_rate_d = (double)rate_before * applied_U;
+    if (new_rate_d < (double)_poseidon_min_rate_bps) new_rate_d = (double)_poseidon_min_rate_bps;
+    if (new_rate_d > (double)_poseidon_max_rate_bps) new_rate_d = (double)_poseidon_max_rate_bps;
+    _poseidon_rate_bps = (uint64_t)new_rate_d;
+
+    _last_poseidon_mpd_bytes      = mpd_bytes;
+    _last_poseidon_mpt_bytes      = mpt_bytes;
+    _last_poseidon_rate_after_bps = _poseidon_rate_bps;
+    _last_poseidon_mpd = csig_delay_ps;
+    _last_poseidon_mpt = mpt_delay_ps;       // delay-equivalent for plots only
+    _last_effective_target_Qdelay = mpt_delay_ps;
+    _last_poseidon_raw_U     = raw_U;
+    _last_poseidon_applied_U = applied_U;
+    _last_poseidon_cwnd_pkts = cwnd_pkts;
+    _last_control_mode       = "poseidon_rate";
+    if (raw_U > 1.01)       _last_nscc_branch = "poseidon_rate_inc";
+    else if (raw_U < 0.99)  _last_nscc_branch = "poseidon_rate_dec";
+    else                    _last_nscc_branch = "poseidon_rate_hold";
+
+    poseidon_rate_recompute_cwnd();
+
+    if (_poseidon_rate_bps > rate_before) {
+        _nscc_overall_stats.inc_fast_bytes += (_poseidon_rate_bps - rate_before) / 1000;
+    } else if (_poseidon_rate_bps < rate_before) {
+        _nscc_overall_stats.dec_multi_bytes += (rate_before - _poseidon_rate_bps) / 1000;
+    }
+}
+
+// CSIG delay drives decrease; min(ABW) gates additive recovery.
+bool UecSrc::csig_delay_abw_on_ack(bool skip,
+                                   simtime_picosec csig_delay_ps,
+                                   bool csig_abw_valid,
+                                   uint64_t csig_abw_bps,
+                                   mem_b newly_acked_bytes) {
+    const mem_b cwnd_before = _cwnd;
+
+    const simtime_picosec t_hop =
+        (_csig_delay_abw_target_divisor > 0.0)
+            ? (simtime_picosec)((double)_target_Qdelay / _csig_delay_abw_target_divisor)
+            : _target_Qdelay;
+    _last_target_hop_delay = t_hop;
+    _last_effective_target_Qdelay = t_hop;
+    _last_control_mode  = "csig_delay_abw";
+
+    if (csig_delay_ps > t_hop) {
+        const double overshoot =
+            (double)(csig_delay_ps - t_hop) / (double)csig_delay_ps;
+        const double reduction = _gamma * overshoot;
+        double factor = 1.0 - reduction;
+        if (factor < 0.5) factor = 0.5;
+        double new_cwnd = (double)_cwnd * factor;
+        if (new_cwnd < (double)_min_cwnd) new_cwnd = (double)_min_cwnd;
+        _cwnd = (mem_b)new_cwnd;
+        _last_nscc_branch = "csig_delay_abw_delay_dec";
+        if (cwnd_before > _cwnd) {
+            _nscc_overall_stats.dec_multi_bytes += cwnd_before - _cwnd;
+            _nscc_fulfill_stats.dec_multi_bytes += cwnd_before - _cwnd;
+        }
+        _last_abw_budget_bytes = 0;
+        _last_abw_delta_bytes  = 0;
+        set_cwnd_bounds();
+        return true;
+    }
+
+    const bool delay_low = csig_delay_ps < (simtime_picosec)
+                            (_csig_delay_abw_low_frac * (double)t_hop);
+    const mem_b cwnd_cap = (mem_b)(0.9 * (double)_maxwnd);
+    if (!skip
+        && csig_abw_valid
+        && delay_low
+        && newly_acked_bytes > 0
+        && _cwnd < cwnd_cap
+        && _base_rtt > 0) {
+        const double base_rtt_s = (double)_base_rtt / 1e12;
+        const double b_abw_bytes = (double)csig_abw_bps * base_rtt_s / 8.0;
+        const mem_b denom = (_cwnd > (mem_b)_mtu) ? _cwnd : (mem_b)_mtu;
+        double delta = _csig_delay_abw_gain * b_abw_bytes
+                       * (double)newly_acked_bytes / (double)denom;
+        if (delta < 0.0) delta = 0.0;
+        const double headroom = (double)(_maxwnd - _cwnd);
+        if (delta > headroom) delta = headroom;
+        _cwnd += (mem_b)delta;
+        _last_abw_budget_bytes = (mem_b)b_abw_bytes;
+        _last_abw_delta_bytes  = (mem_b)delta;
+        _last_nscc_branch = "csig_delay_abw_inc";
+        if (_cwnd > cwnd_before) {
+            _nscc_overall_stats.inc_fast_bytes += _cwnd - cwnd_before;
+            _nscc_fulfill_stats.inc_fast_bytes += _cwnd - cwnd_before;
+        }
+        set_cwnd_bounds();
+        return true;
+    }
+
+    _last_abw_budget_bytes = 0;
+    _last_abw_delta_bytes  = 0;
+    _last_nscc_branch = "csig_delay_abw_hold";
+    return true;
+}
+
+void UecSrc::poseidon_rate_on_nack() {
+    poseidon_rate_init_if_needed();
+    const uint64_t before = _poseidon_rate_bps;
+    uint64_t after = before / 2;
+    if (after < _poseidon_min_rate_bps) after = _poseidon_min_rate_bps;
+    _poseidon_rate_bps = after;
+    poseidon_rate_recompute_cwnd();
+    _last_poseidon_loss_event      = "nack";
+    _last_poseidon_rate_before_bps = before;
+    _last_poseidon_rate_after_bps  = after;
+    _last_control_mode             = "poseidon_rate";
+    _last_nscc_branch              = "poseidon_rate_nack";
+    if (before > 0) {
+        _last_poseidon_raw_U = (double)after / (double)before;
+        _last_poseidon_applied_U = _last_poseidon_raw_U;
+    }
+    if (before > after) {
+        _nscc_overall_stats.dec_nack_bytes += (before - after) / 1000;
+    }
+}
+
+void UecSrc::poseidon_rate_on_rto() {
+    const uint64_t before = _poseidon_rate_bps;
+    _poseidon_rate_bps = (_poseidon_init_rate_bps > 0)
+                             ? _poseidon_init_rate_bps
+                             : _poseidon_max_rate_bps;
+    _poseidon_first_ack = true;   // re-enter first-ACK state; next ACK re-baselines.
+    _poseidon_next_send_time = 0; // let sender fire immediately on next permit.
+    poseidon_rate_recompute_cwnd();
+    _last_poseidon_loss_event      = "rto";
+    _last_poseidon_rate_before_bps = before;
+    _last_poseidon_rate_after_bps  = _poseidon_rate_bps;
+    _last_nscc_branch              = "poseidon_rate_rto";
+}
+
+simtime_picosec UecSrc::poseidon_rate_gate_delay_ps() const {
+    if (!(_nscc_csig_poseidon_rate_enabled && _nscc_csig_enabled)) return 0;
+    const simtime_picosec now = eventlist().now();
+    if (_poseidon_next_send_time <= now) return 0;
+    return _poseidon_next_send_time - now;
+}
+
+bool UecSrc::quick_adapt(bool is_loss, bool skip, simtime_picosec delay,
+                          double effective_qa_threshold) {
     bool qa_done_or_ignore = false;
 
     if (_disable_quick_adapt) {
@@ -1150,15 +1453,16 @@ bool UecSrc::quick_adapt(bool is_loss, bool skip, simtime_picosec delay) {
     }
 
     if (_debug_src){
-        cout << "At " << timeAsUs(eventlist().now()) << " " << _flow.str() << " quickadapt called is loss "<< is_loss << " delay " << delay 
-             << " qa_endtime " << timeAsUs(_qa_endtime) << " trigger qa " << _trigger_qa << endl;
+        cout << "At " << timeAsUs(eventlist().now()) << " " << _flow.str() << " quickadapt called is loss "<< is_loss << " delay " << delay
+             << " qa_endtime " << timeAsUs(_qa_endtime) << " trigger qa " << _trigger_qa
+             << " qa_threshold " << effective_qa_threshold << endl;
     }
 
     if (_bytes_ignored < _bytes_to_ignore && skip) {
         qa_done_or_ignore = true;
     } else if (eventlist().now() > _qa_endtime){
-        if (_qa_endtime != 0 
-                && (_trigger_qa || is_loss || (delay > _qa_threshold)) 
+        if (_qa_endtime != 0
+                && (_trigger_qa || is_loss || (delay > effective_qa_threshold))
                 && _achieved_bytes < (_maxwnd >> _qa_gate)) {
 
             if (_debug_src) {
@@ -1173,6 +1477,8 @@ bool UecSrc::quick_adapt(bool is_loss, bool skip, simtime_picosec delay) {
             
             mem_b before = _cwnd;
             _cwnd = max(_achieved_bytes, _min_cwnd); //* _qa_scaling;
+            // quick_adapt fired and shrank cwnd; record the branch.
+            _last_nscc_branch = "quick_dec";
             _nscc_overall_stats.dec_quick_bytes += before - _cwnd;
             _nscc_fulfill_stats.dec_quick_bytes += before - _cwnd;
 
@@ -1201,20 +1507,22 @@ bool UecSrc::quick_adapt(bool is_loss, bool skip, simtime_picosec delay) {
 
 void UecSrc::fair_increase(uint32_t newly_acked_bytes){
     mem_b before = _inc_bytes;
-    _inc_bytes += _fi * newly_acked_bytes; //increase by 16Million!
+    _inc_bytes += (mem_b)(_fi * newly_acked_bytes);
     _nscc_fulfill_stats.inc_fair_bytes += _inc_bytes - before;
 }
 
-void UecSrc::proportional_increase(uint32_t newly_acked_bytes,simtime_picosec delay){
+void UecSrc::proportional_increase(uint32_t newly_acked_bytes, simtime_picosec delay,
+                                    simtime_picosec effective_target){
     fast_increase(newly_acked_bytes, delay);
     if (_increase)
         return;
-    
-    //make sure targetQdelay > delay;
-    assert(_target_Qdelay > delay);
+
+    // Caller (updateCwndOnAck_NSCC) only routes here when delay < effective_target.
+    assert(effective_target > delay);
 
     mem_b before = _inc_bytes;
-    _inc_bytes += _alpha * newly_acked_bytes * (_target_Qdelay - delay);
+    _inc_bytes += (mem_b)(_alpha * newly_acked_bytes
+                          * (effective_target - delay));
     _nscc_fulfill_stats.inc_prop_bytes += _inc_bytes - before;
 }
 
@@ -1223,10 +1531,13 @@ void UecSrc::fast_increase(uint32_t newly_acked_bytes,simtime_picosec delay){
         _fi_count += newly_acked_bytes;
         if (_fi_count > _cwnd || _increase){
             mem_b before = _cwnd;
-            _cwnd += newly_acked_bytes * _fi_scale;
+            _cwnd += (mem_b)(newly_acked_bytes * _fi_scale);
             _nscc_overall_stats.inc_fast_bytes += _cwnd - before;
             _nscc_fulfill_stats.inc_fast_bytes += _cwnd - before;
 
+            // fast_increase wins over the prop_inc tag when it actually fires
+            // (proportional_increase calls fast_increase first then bails).
+            _last_nscc_branch = "fast_inc";
             _increase = true;
             return;
         }
@@ -1237,19 +1548,25 @@ void UecSrc::fast_increase(uint32_t newly_acked_bytes,simtime_picosec delay){
     _increase = false;
 }
 
-void UecSrc::multiplicative_decrease() {
+// Caller supplies the congestion-delay sample and the per-ACK target.
+void UecSrc::multiplicative_decrease(simtime_picosec delay,
+                                      simtime_picosec effective_target) {
     _increase = false;
     _fi_count = 0;
-    simtime_picosec avg_delay = get_avg_delay();
-    if (avg_delay > _target_Qdelay){
+    if (delay > effective_target){
         if (eventlist().now() - _last_dec_time > _base_rtt){
             mem_b before = _cwnd;
-            _cwnd *= max(1-_gamma*(avg_delay-_target_Qdelay)/avg_delay, 0.5);/*_max_md_jump instead of 1*/
+            const double overshoot = (double)(delay - effective_target) / (double)delay;
+            const double reduction = _gamma * overshoot;
+            _cwnd *= max(1 - reduction, 0.5);
             _cwnd = max(_cwnd, _min_cwnd);
             _nscc_overall_stats.dec_multi_bytes += before - _cwnd;
             _nscc_fulfill_stats.dec_multi_bytes += before - _cwnd;
-
             _last_dec_time = eventlist().now();
+            // Only stamp "multi_dec" when the cwnd reduction actually fires.
+            // The dispatch in updateCwndOnAck_NSCC pre-tagged
+            // "multi_dec_skipped" so a rate-limited skip stays distinguishable.
+            _last_nscc_branch = "multi_dec";
         }
     }
 }
@@ -1266,10 +1583,14 @@ void UecSrc::fulfill_adjustment(){
     _nscc_overall_stats.inc_prop_bytes += _nscc_fulfill_stats.inc_prop_bytes;
 
     if ((eventlist().now() - _last_adjust_time) >= _adjust_period_threshold) {
-        _cwnd += _eta;
-        _nscc_overall_stats.inc_eta_bytes += _eta;
-        _nscc_fulfill_stats.inc_eta_bytes += _eta;
+        mem_b eta_inc = (mem_b)_eta;
+        _cwnd += eta_inc;
+        _nscc_overall_stats.inc_eta_bytes += eta_inc;
+        _nscc_fulfill_stats.inc_eta_bytes += eta_inc;
         _last_adjust_time = eventlist().now();
+        // Eta fires from inside fulfill_adjustment; overwrite any prior
+        // per-ACK branch tag with the more recent action.
+        _last_nscc_branch = "eta_inc";
     }
 
     if (_debug_src) {
@@ -1297,7 +1618,9 @@ void UecSrc::fulfill_adjustment(){
 void UecSrc::mark_packet_for_retransmission(UecBasePacket::seq_t psn, uint16_t pktsize){
     _in_flight -= pktsize;
     //assert (_in_flight>=0);
-    _cwnd = max(_cwnd - pktsize, (mem_b)_mtu);
+    if (!(_nscc_csig_poseidon_rate_enabled && _nscc_csig_enabled)) {
+        _cwnd = max(_cwnd - pktsize, (mem_b)_mtu);
+    }
     if(_flow.flow_id() == _debug_flowid)
         cout <<timeAsUs(eventlist().now()) <<" flowid " << _flow.flow_id()<< " mark_packet_for_retransmission  _cwnd " << _cwnd << endl;    
     //_rtx_count ++;
@@ -1310,31 +1633,57 @@ void UecSrc::dontUpdateCwndOnAck(bool skip, simtime_picosec delay, mem_b newly_a
 void UecSrc::updateCwndOnAck_NSCC(bool skip, simtime_picosec delay, mem_b newly_acked_bytes) {
     // bool can_decrease = _exp_avg_ecn > _ecn_thresh;
 
-    if (quick_adapt(false, skip, delay))
-        return;
+    _last_nscc_branch = "none";
+    _last_control_mode = "nscc_legacy";
+    _last_poseidon_loss_event = "none";
+    const simtime_picosec memory_delay = delay;
 
-    if (!skip && delay >= _target_Qdelay) {
+    if (_nscc_csig_poseidon_rate_enabled && _nscc_csig_enabled) {
+        poseidon_rate_on_ack(delay, _raw_rtt, newly_acked_bytes);
+        return;
+    }
+
+    if (_nscc_csig_delay_abw_enabled) {
+        const bool abw_valid = (_last_csig_abw_bps > 0);
+        const bool handled = csig_delay_abw_on_ack(
+            skip, delay, abw_valid, _last_csig_abw_bps,
+            newly_acked_bytes);
+        if (handled) return;
+    }
+
+    simtime_picosec effective_target = _target_Qdelay;
+    double effective_qa_threshold = _qa_threshold;
+    _last_effective_target_Qdelay = effective_target;
+
+    if (quick_adapt(false, skip, memory_delay, effective_qa_threshold)) {
+        // quick_adapt sets the tag itself only when it actually shrinks cwnd.
+        return;
+    }
+
+    if (!skip && delay >= effective_target) {
+        _last_nscc_branch = "fair_inc";
         fair_increase(newly_acked_bytes);
         if (_flow.flow_id() == _debug_flowid || UecSrc::_debug) {
-            cout << timeAsUs(eventlist().now()) <<" flowid " << _flow.flow_id()<< " " << _flow.str() << " fair_increase _nscc_cwnd " << _cwnd 
-                << " newly_acked_bytes " << newly_acked_bytes 
+            cout << timeAsUs(eventlist().now()) <<" flowid " << _flow.flow_id()<< " " << _flow.str() << " fair_increase _nscc_cwnd " << _cwnd
+                << " newly_acked_bytes " << newly_acked_bytes
                 << " fi " << _fi << endl;
         }
-    } else if (!skip && delay < _target_Qdelay) {
-        proportional_increase(newly_acked_bytes,delay);
+    } else if (!skip && delay < effective_target) {
+        _last_nscc_branch = "prop_inc";
+        proportional_increase(newly_acked_bytes, delay, effective_target);
         if (_flow.flow_id() == _debug_flowid || UecSrc::_debug) {
             cout << timeAsUs(eventlist().now()) <<" flowid " << _flow.flow_id()<< " " << _flow.str() << " proportional_increase _nscc_cwnd " << _cwnd << endl;
         }
-    } else if (skip && delay >= _target_Qdelay) {    
-        multiplicative_decrease();
+    } else if (skip && delay >= effective_target) {
+        _last_nscc_branch = "multi_dec_skipped";
+        multiplicative_decrease(memory_delay, effective_target);
         if (_flow.flow_id() == _debug_flowid || UecSrc::_debug) {
             cout << timeAsUs(eventlist().now()) <<" flowid " << _flow.flow_id()<< " " << _flow.str() << " multiplicative_decrease _nscc_cwnd " << _cwnd << endl;
         }
-    } else if (skip && delay < _target_Qdelay) {
-        // NOOP, just switch path
+    } else if (skip && delay < effective_target) {
+        _last_nscc_branch = "skip_no_dec";
     }
 
-    // Check here, fulfill_adjustment requires valid cwnd.
     set_cwnd_bounds();
 
     // if ( _received_bytes > _adjust_bytes_threshold || eventlist().now() - _last_adjust_time > _adjust_period_threshold ) {
@@ -1357,6 +1706,12 @@ void UecSrc::updateCwndOnAck_NSCC(bool skip, simtime_picosec delay, mem_b newly_
 }
 
 void UecSrc::updateCwndOnNack_NSCC(bool skip, mem_b nacked_bytes, bool last_hop) {
+    if (_nscc_csig_poseidon_rate_enabled && _nscc_csig_enabled) {
+        _bytes_ignored += nacked_bytes;
+        poseidon_rate_on_nack();
+        return;
+    }
+
     bool adjust_cwnd = true;
 
     _bytes_ignored += nacked_bytes;
@@ -1373,7 +1728,7 @@ void UecSrc::updateCwndOnNack_NSCC(bool skip, mem_b nacked_bytes, bool last_hop)
              << " onnack  _nscc_cwnd " << _cwnd << endl;
 
     _trigger_qa = true;
-    if (quick_adapt(true, true, 0)) {
+    if (quick_adapt(true, true, 0, _qa_threshold)) {
         adjust_cwnd = false;
     }
 
@@ -1609,6 +1964,308 @@ void UecSrc::processNack(const UecNackPacket& pkt) {
     sendIfPermitted();
 }
 
+void UecSrc::processAckCcx(const UecAckCcxPacket& pkt) {
+    assert(pkt.ccx_type() == CCX_TYPE_NSCC_CSIG);
+    _nic.logReceivedCtrl(pkt.size());
+
+    auto acked_psn = pkt.acked_psn();
+    auto i = _tx_bitmap.find(acked_psn);
+    auto rtx_time = _rtx_times.find(acked_psn);
+    bool rtx_echo = pkt.rtx_echo();
+
+    mem_b pkt_size;
+    simtime_picosec raw_rtt = 0;
+    simtime_picosec send_time = 0;
+    // Default to RTT-derived delay; active CSIG modes override this below with
+    // the reflected max-hop delay.
+    simtime_picosec delay = 0;
+
+    if (i != _tx_bitmap.end() && validateSendTs(acked_psn, pkt.rtx_echo()) && (!pkt.is_probe_ack()) ) {
+        if(_flow.flow_id() == _debug_flowid ){
+            cout <<  timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id()
+                << " rtx_times "<< rtx_time->second
+                << " rtx_echo " << rtx_echo
+                << " packet_type " << pkt.is_probe_ack()
+                << " _probe_psn " << _probe_seqno
+                << " psn " << pkt.acked_psn()
+                << endl;
+        }
+        send_time = i->second.send_time;
+        pkt_size = i->second.pkt_size;
+        raw_rtt = eventlist().now() - send_time;
+
+        if (!pkt.is_rts()) {
+            update_base_rtt(raw_rtt);
+        }
+        if (raw_rtt >= _base_rtt) {
+            update_delay(raw_rtt, true, pkt.ecn_echo());
+            delay = raw_rtt - _base_rtt;
+        } else {
+            delay = get_avg_delay();
+        }
+    } else {
+        if (UecSrc::_debug)
+            cout << "Can't find send record for seqno " << acked_psn << endl;
+        if (pkt.is_probe_ack()){
+            if (_probe_seqno == pkt.acked_psn()){
+                _raw_rtt = eventlist().now() - _probe_send_time ;
+                if (_raw_rtt < _base_rtt){
+                    delay = 0;
+                    _raw_rtt = _base_rtt;
+                }else{
+                    delay = _raw_rtt - _base_rtt;
+                    update_delay(_raw_rtt, true, pkt.ecn_echo());
+                }
+            } else {
+                delay = get_avg_delay();
+            }
+            pkt_size = 0;
+        }else{
+            pkt_size = _mtu;
+            delay = get_avg_delay();
+        }
+    }
+
+    // Capture pre-override delay so the trace can show what RTT-derived
+    // delay would have been used in baseline mode (counterfactual).
+    simtime_picosec rtt_delay_before_override = delay;
+    if (_nscc_csig_enabled || _nscc_csig_delay_abw_enabled) {
+        // Poseidon-rate and delay+ABW use reflected max-hop delay.
+        delay = (simtime_picosec)pkt.csig_delay_ns() * 1000;
+    }
+
+    _last_abw_budget_bytes = 0;
+    _last_abw_delta_bytes  = 0;
+    _last_csig_abw_bps = 0;
+
+    if (_nscc_csig_delay_abw_enabled && pkt.csig_abw_valid()) {
+        _last_csig_abw_encoded = pkt.csig_abw_encoded();
+        _last_csig_abw_bps = decode_csig_abw_for_scale(_last_csig_abw_encoded);
+    }
+
+    AckFields f;
+    f.cum_ack = pkt.cumulative_ack();
+    f.acked_psn = acked_psn;
+    f.ref_ack = pkt.ref_ack();
+    f.bitmap = pkt.bitmap();
+    f.recvd_bytes = pkt.recvd_bytes();
+    f.rcv_wnd_pen = pkt.rcv_wnd_pen();
+    f.ev = pkt.ev();
+    f.ooo = pkt.ooo();
+    f.ecn_echo = pkt.ecn_echo();
+    f.rtx_echo = pkt.rtx_echo();
+    f.is_rts = pkt.is_rts();
+    f.is_probe_ack = pkt.is_probe_ack();
+
+    mem_b cwnd_before = _cwnd;
+    uint64_t prev_recvd_bytes = _recvd_bytes;
+    processAckCommon(f, delay, raw_rtt, send_time, pkt_size);
+
+    if (_csig_trace_enabled) {
+        // Mirrors the plain ACK emission so per-flow byte
+        // accounting is complete across both ACK schemas.
+        uint64_t nb = f.recvd_bytes > prev_recvd_bytes
+                          ? f.recvd_bytes - prev_recvd_bytes : 0;
+        if (nb > 0) {
+            cout << "CSIG_FLOW"
+                 << " t_us="              << timeAsUs(eventlist().now())
+                 << " flow="              << _flow.flow_id()
+                 << " newly_acked_bytes=" << nb
+                 << "\n";
+        }
+    }
+
+    if (_csig_trace_enabled && _flow.flow_id() == _debug_flowid) {
+        uint64_t newly_acked_bytes = f.recvd_bytes > prev_recvd_bytes
+                                         ? f.recvd_bytes - prev_recvd_bytes : 0;
+        uint32_t abw_encoded = pkt.csig_abw_valid() ? pkt.csig_abw_encoded() : 0u;
+        // Use the for-scale decoder so the trace shows the same value the
+        // sender actually scaled by (max bucket -> exactly link capacity).
+        uint64_t abw_bps     = pkt.csig_abw_valid()
+                                   ? decode_csig_abw_for_scale(pkt.csig_abw_encoded()) : 0ULL;
+        double abw_fraction_val = 1.0;
+        if (pkt.csig_abw_valid() && g_csig_abw_link_capacity_bps > 0) {
+            abw_fraction_val = (double)abw_bps / (double)g_csig_abw_link_capacity_bps;
+            if (abw_fraction_val < 0.0) abw_fraction_val = 0.0;
+            if (abw_fraction_val > 1.0) abw_fraction_val = 1.0;
+        }
+        double csig_delay_us = (double)pkt.csig_delay_ns() / 1000.0;
+        cout << "CSIG_TRACE"
+             << " t_us="                       << timeAsUs(eventlist().now())
+             << " flow="                       << _flow.flow_id()
+             << " ack_type=ACK_CCX"
+             << " cwnd_before_bytes="          << cwnd_before
+             << " cwnd_after_bytes="           << _cwnd
+             << " in_flight_bytes="            << _in_flight
+             << " raw_rtt_us="                 << timeAsUs(raw_rtt)
+             << " rtt_delay_us_counterfactual="<< timeAsUs(rtt_delay_before_override)
+             << " control_delay_us_used="      << timeAsUs(delay)
+             << " ecn_echo="                   << (pkt.ecn_echo() ? 1 : 0)
+             << " csig_delay_us="              << csig_delay_us
+             << " csig_abw_valid="             << (pkt.csig_abw_valid() ? 1 : 0)
+             << " csig_abw_encoded="           << abw_encoded
+             << " csig_abw_bps="               << abw_bps
+             << " abw_fraction="               << abw_fraction_val
+             << " abw_budget_bytes="           << _last_abw_budget_bytes
+             << " abw_delta_bytes="            << _last_abw_delta_bytes
+             << " acked_psn="                  << acked_psn
+             << " newly_acked_bytes="          << newly_acked_bytes
+             << " nscc_branch="                << (_last_nscc_branch ? _last_nscc_branch : "none")
+             << " effective_target_us="        << timeAsUs(_last_effective_target_Qdelay)
+             << " target_hop_delay_us="        << timeAsUs(_last_target_hop_delay)
+             << " control_mode="               << (_last_control_mode ? _last_control_mode : "nscc_legacy");
+
+        if (_nscc_csig_poseidon_rate_enabled) {
+            cout << " poseidon_mpd_us="            << timeAsUs(_last_poseidon_mpd)
+                 << " poseidon_mpt_us="            << timeAsUs(_last_poseidon_mpt)
+                 << " poseidon_raw_update_ratio="     << _last_poseidon_raw_U
+                 << " poseidon_applied_update_ratio=" << _last_poseidon_applied_U
+                 << " poseidon_m="                 << _nscc_csig_poseidon_m
+                 << " poseidon_mpd_bytes="         << _last_poseidon_mpd_bytes
+                 << " poseidon_mpt_bytes="         << _last_poseidon_mpt_bytes
+                 << " poseidon_rate_bps="          << _poseidon_rate_bps
+                 << " poseidon_rate_before_bps="   << _last_poseidon_rate_before_bps
+                 << " poseidon_rate_after_bps="    << _last_poseidon_rate_after_bps
+                 << " poseidon_cwnd_pkts="         << _last_poseidon_cwnd_pkts
+                 << " poseidon_loss_event="        << (_last_poseidon_loss_event ? _last_poseidon_loss_event : "none");
+        }
+        cout << endl;
+    }
+}
+
+void UecSrc::processNackCcx(const UecNackCcxPacket& pkt) {
+    assert(pkt.nccx_type() == NCCX_TYPE_CSIG);
+    _nic.logReceivedCtrl(pkt.size());
+    _stats.nacks_received++;
+
+    auto nacked_seqno = pkt.ref_ack();
+    if (_debug_src) {
+        cout << _flow.str() << " " << _nodename << " processNackCcx nacked: " << nacked_seqno << " flow " << _flow.str()
+             << " csig_delay_ns " << pkt.csig_delay_ns() << endl;
+    }
+
+    uint16_t ev = pkt.ev();
+
+    auto i = _tx_bitmap.find(nacked_seqno);
+    if (i == _tx_bitmap.end()) {
+        if (_debug_src)
+            cout << _flow.str() << " " << "Didn't find NACKed packet in _active_packets flow " << _flow.str() << endl;
+        return;
+    }
+
+    mem_b pkt_size = i->second.pkt_size;
+
+    assert(pkt_size >= _hdr_size);
+    if (pkt_size == _hdr_size) {
+        _stats.rts_nacks++;
+    }
+
+    auto seqno = i->first;
+    simtime_picosec send_time = i->second.send_time;
+    simtime_picosec raw_rtt = eventlist().now() - send_time;
+
+    if (update_base_rtt_on_nack) {
+        update_base_rtt(raw_rtt);
+    }
+
+    if(raw_rtt >= _base_rtt) {
+        update_delay(raw_rtt, false, true);
+    }
+
+    if(_flow.flow_id() == _debug_flowid){
+        cout << timeAsUs(eventlist().now()) << " flowid " << _flow.flow_id() << " ev " << ev
+            << " seqno " << seqno
+            << " trimming (ccx)" << endl;
+    }
+    // NACK_CCX carries the reflected delay for completeness. Legacy NSCC keeps
+    // its existing NACK path; csig_poseidon_rate handles the NACK as an
+    // explicit rate-halving loss signal and emits a trace row below.
+    mem_b cwnd_before = _cwnd;
+    if (_sender_based_cc){
+        (this->*updateCwndOnNack)(ev, pkt_size, pkt.last_hop());
+    }
+
+    if (_csig_trace_enabled
+        && _flow.flow_id() == _debug_flowid
+        && _nscc_csig_poseidon_rate_enabled && _nscc_csig_enabled) {
+        const simtime_picosec csig_delay_ps = (simtime_picosec)pkt.csig_delay_ns() * 1000;
+        const double link_bps = (double)g_csig_link_capacity_bps;
+        _last_poseidon_mpd = csig_delay_ps;
+        _last_poseidon_mpd_bytes = (link_bps > 0.0)
+            ? ((double)csig_delay_ps * link_bps / (8.0 * 1e12))
+            : 0.0;
+        _last_poseidon_mpt_bytes = poseidon_rate_mpt_bytes(_poseidon_rate_bps);
+        _last_poseidon_mpt = (link_bps > 0.0)
+            ? (simtime_picosec)(_last_poseidon_mpt_bytes * 8.0 * 1e12 / link_bps)
+            : 0;
+        _last_effective_target_Qdelay = _last_poseidon_mpt;
+        _last_control_mode = "poseidon_rate";
+
+        const simtime_picosec rtt_delay = (raw_rtt >= _base_rtt)
+            ? (raw_rtt - _base_rtt) : 0;
+        cout << "CSIG_TRACE"
+             << " t_us="                       << timeAsUs(eventlist().now())
+             << " flow="                       << _flow.flow_id()
+             << " ack_type=NACK_CCX"
+             << " cwnd_before_bytes="          << cwnd_before
+             << " cwnd_after_bytes="           << _cwnd
+             << " in_flight_bytes="            << _in_flight
+             << " raw_rtt_us="                 << timeAsUs(raw_rtt)
+             << " rtt_delay_us_counterfactual="<< timeAsUs(rtt_delay)
+             << " control_delay_us_used="      << timeAsUs(csig_delay_ps)
+             << " ecn_echo="                   << (pkt.ecn_echo() ? 1 : 0)
+             << " csig_delay_us="              << ((double)pkt.csig_delay_ns() / 1000.0)
+             << " csig_abw_valid=0"
+             << " csig_abw_encoded=0"
+             << " csig_abw_bps=0"
+             << " abw_fraction=1"
+             << " abw_budget_bytes=0"
+             << " abw_delta_bytes=0"
+             << " acked_psn="                  << nacked_seqno
+             << " newly_acked_bytes=0"
+             << " nscc_branch="                << (_last_nscc_branch ? _last_nscc_branch : "none")
+             << " effective_target_us="        << timeAsUs(_last_effective_target_Qdelay)
+             << " control_mode="               << (_last_control_mode ? _last_control_mode : "poseidon_rate")
+             << " poseidon_mpd_us="            << timeAsUs(_last_poseidon_mpd)
+             << " poseidon_mpt_us="            << timeAsUs(_last_poseidon_mpt)
+             << " poseidon_raw_update_ratio="     << _last_poseidon_raw_U
+             << " poseidon_applied_update_ratio=" << _last_poseidon_applied_U
+             << " poseidon_m="                 << _nscc_csig_poseidon_m
+             << " poseidon_mpd_bytes="         << _last_poseidon_mpd_bytes
+             << " poseidon_mpt_bytes="         << _last_poseidon_mpt_bytes
+             << " poseidon_rate_bps="          << _poseidon_rate_bps
+             << " poseidon_rate_before_bps="   << _last_poseidon_rate_before_bps
+             << " poseidon_rate_after_bps="    << _last_poseidon_rate_after_bps
+             << " poseidon_cwnd_pkts="         << _last_poseidon_cwnd_pkts
+             << " poseidon_loss_event="        << (_last_poseidon_loss_event ? _last_poseidon_loss_event : "none")
+             << endl;
+    }
+
+    if (_debug_src)
+        cout << _flow.str() << " " << _nodename << " erasing send record, seqno: " << seqno << " flow " << _flow.str()
+             << endl;
+    _tx_bitmap.erase(i);
+    assert(_tx_bitmap.find(seqno) == _tx_bitmap.end());
+
+    _in_flight -= pkt_size;
+
+    delFromSendTimes(send_time, seqno);
+
+    stopSpeculating();
+    queueForRtx(seqno, pkt_size);
+
+    if (send_time == _rto_send_time) {
+        recalculateRTO();
+    }
+
+    if (pkt.last_hop())
+        _mp->processEv(ev, pkt.ecn_echo() ? UecMultipath::PATH_ECN : UecMultipath::PATH_GOOD);
+    else
+        _mp->processEv(ev, UecMultipath::PATH_NACK);
+
+    sendIfPermitted();
+}
+
 void UecSrc::processPull(const UecPullPacket& pkt) {
     _nic.logReceivedCtrl(pkt.size());
     _stats.pulls_received++;
@@ -1625,6 +2282,8 @@ void UecSrc::processPull(const UecPullPacket& pkt) {
 }
 
 void UecSrc::doNextEvent() {
+    _poseidon_wake_pending = false;
+
     if (_rtx_timeout_pending && eventlist().now() == _rtx_timeout) {
         clearRTO();
         assert(_logger == 0);
@@ -1646,6 +2305,13 @@ void UecSrc::doNextEvent() {
             }
             sendProbe();
         }
+    }
+
+    if (_sender_based_cc && _nscc_csig_poseidon_rate_enabled
+        && _nscc_csig_enabled
+        && (_backlog > 0 || !_rtx_queue.empty())
+        && !_done_sending) {
+        sendIfPermitted();
     }
 }
 
@@ -1705,6 +2371,14 @@ void UecSrc::addToBacklog(mem_b size) {
 void UecSrc::startConnection() {
     //_cwnd = _maxwnd;
     _credit = _configured_maxwnd;
+
+    if (_sender_based_cc && _nscc_csig_poseidon_rate_enabled
+        && _nscc_csig_enabled) {
+        poseidon_rate_init_if_needed();
+        poseidon_rate_recompute_cwnd();
+        _poseidon_next_send_time = eventlist().now();
+        _poseidon_first_ack      = true;
+    }
 
     if (_debug_src)
         cout << _flow.str() << " " << "startflow " << _flow._name << " CWND " << _cwnd << " at "
@@ -1774,6 +2448,12 @@ bool UecSrc::isSendPermitted() {
 
     if (_receiver_based_cc && !can_send_RCCC()) {
         // can send if we have *any* credit, but we don't                                                                                                         
+        return false;
+    }
+
+    if (_sender_based_cc && _nscc_csig_poseidon_rate_enabled
+        && _nscc_csig_enabled
+        && poseidon_rate_gate_delay_ps() > 0) {
         return false;
     }
 
@@ -1938,6 +2618,18 @@ void UecSrc::sendIfPermitted() {
         }
     }
 
+    if (_sender_based_cc
+        && _nscc_csig_poseidon_rate_enabled && _nscc_csig_enabled) {
+        const simtime_picosec wait = poseidon_rate_gate_delay_ps();
+        if (wait > 0) {
+            if (!_poseidon_wake_pending) {
+                _poseidon_wake_pending = true;
+                eventlist().sourceIsPendingRel(*this, wait);
+            }
+            return;
+        }
+    }
+
     if (_rtx_queue.empty()) {
         if (_backlog == 0) {
             return;
@@ -2083,11 +2775,25 @@ mem_b UecSrc::sendNewPacket(const Route& route) {
     auto* p = UecDataPacket::newpkt(_flow, route, _highest_sent, full_pkt_size, ptype,
                                      _pull_target, _dstaddr);
 
+    if (_sender_cc_algo == NSCC) {
+        if (_nscc_csig_enabled || _nscc_csig_poseidon_rate_enabled
+            || _nscc_csig_delay_abw_enabled) {
+            p->set_csig_enabled(true);
+            p->set_csig_delay_ns(0);
+            p->set_csig_reflect_req(true);
+        }
+        if (_nscc_csig_delay_abw_enabled) {
+            p->set_csig_abw_enabled(true);
+            p->set_csig_abw_encoded(csig_abw_initial_min());
+            p->set_csig_reflect_req(true);
+        }
+    }
+
     uint16_t ev = _mp->nextEntropy(_highest_sent, (uint64_t)_cwnd/_mss);
     p->set_pathid(ev);
     p->flow().logTraffic(*p, *this, TrafficLogger::PKT_CREATESEND);
 
-    if (_backlog == 0 || (_receiver_based_cc && _credit <= 0) || ( _sender_based_cc &&  (_in_flight + full_pkt_size) >= _cwnd )) 
+    if (_backlog == 0 || (_receiver_based_cc && _credit <= 0) || ( _sender_based_cc &&  (_in_flight + full_pkt_size) >= _cwnd ))
         p->set_ar(true);
     
     createSendRecord(_highest_sent, full_pkt_size);
@@ -2107,6 +2813,16 @@ mem_b UecSrc::sendNewPacket(const Route& route) {
     _highest_sent++;
     _stats.new_pkts_sent++;
     startRTO(eventlist().now());
+
+    if (_sender_based_cc && _nscc_csig_poseidon_rate_enabled
+        && _nscc_csig_enabled) {
+        _poseidon_last_pkt_size = full_pkt_size;
+        if (_poseidon_rate_bps > 0) {
+            const double tx_ps = ((double)full_pkt_size * 8.0 * 1e12)
+                                 / (double)_poseidon_rate_bps;
+            _poseidon_next_send_time = eventlist().now() + (simtime_picosec)tx_ps;
+        }
+    }
 
     assert(full_pkt_size > 0);
 
@@ -2128,6 +2844,20 @@ mem_b UecSrc::sendRtxPacket(const Route& route) {
     auto* p = UecDataPacket::newpkt(_flow, route, seq_no, full_pkt_size, UecDataPacket::DATA_RTX,
                                      _pull_target, _dstaddr);
 
+    if (_sender_cc_algo == NSCC) {
+        if (_nscc_csig_enabled || _nscc_csig_poseidon_rate_enabled
+            || _nscc_csig_delay_abw_enabled) {
+            p->set_csig_enabled(true);
+            p->set_csig_delay_ns(0);
+            p->set_csig_reflect_req(true);
+        }
+        if (_nscc_csig_delay_abw_enabled) {
+            p->set_csig_abw_enabled(true);
+            p->set_csig_abw_encoded(csig_abw_initial_min());
+            p->set_csig_reflect_req(true);
+        }
+    }
+
     uint16_t ev = _mp->nextEntropy(_highest_sent, (uint64_t)_cwnd/_mss);
     p->set_pathid(ev);
     p->flow().logTraffic(*p, *this, TrafficLogger::PKT_CREATESEND);
@@ -2148,6 +2878,17 @@ mem_b UecSrc::sendRtxPacket(const Route& route) {
     p->sendOn();
     _stats.rtx_pkts_sent++;
     startRTO(eventlist().now());
+
+    if (_sender_based_cc && _nscc_csig_poseidon_rate_enabled
+        && _nscc_csig_enabled) {
+        _poseidon_last_pkt_size = full_pkt_size;
+        if (_poseidon_rate_bps > 0) {
+            const double tx_ps = ((double)full_pkt_size * 8.0 * 1e12)
+                                 / (double)_poseidon_rate_bps;
+            _poseidon_next_send_time = eventlist().now() + (simtime_picosec)tx_ps;
+        }
+    }
+
     return full_pkt_size;
 }
 
@@ -2249,6 +2990,19 @@ void UecSrc::timeToSend(const Route& route) {
         return;
     }
 
+    if (_sender_based_cc && _nscc_csig_poseidon_rate_enabled
+        && _nscc_csig_enabled) {
+        const simtime_picosec wait = poseidon_rate_gate_delay_ps();
+        if (wait > 0) {
+            if (!_poseidon_wake_pending) {
+                _poseidon_wake_pending = true;
+                eventlist().sourceIsPendingRel(*this, wait);
+            }
+            _nic.cantSend(*this);
+            return;
+        }
+    }
+
     mem_b next_packet_size = getNextPacketSize();
     if (_sender_based_cc && !can_send_NSCC(next_packet_size)) {
         if (_debug_src)
@@ -2319,6 +3073,10 @@ void UecSrc::recalculateRTO() {
 void UecSrc::rtxTimerExpired() {
     assert(eventlist().now() == _rtx_timeout);
     clearRTO();
+
+    if (_nscc_csig_poseidon_rate_enabled && _nscc_csig_enabled) {
+        poseidon_rate_on_rto();
+    }
 
     auto first_entry = _send_times.begin();
     assert(first_entry != _send_times.end());
@@ -2571,11 +3329,19 @@ void UecSink::handlePullTarget(UecBasePacket::seq_t pt) {
 void UecSink::processData(UecDataPacket& pkt) {
     bool force_ack = false;
     if (pkt.packet_type() == UecBasePacket::DATA_PROBE){
-        UecAckPacket* ack_packet =
-            sack(pkt.path_id(), sackBitmapBase(pkt.epsn()), pkt.epsn(), (bool)(pkt.flags() & ECN_CE), pkt.retransmitted());
-        ack_packet->set_probe_ack(true);
-        _nic.sendControlPacket(ack_packet, NULL, this);   
-        return;     
+        if (pkt.csig_enabled() && pkt.csig_reflect_req()) {
+            UecAckCcxPacket* ack_packet =
+                sack_ccx(pkt.path_id(), sackBitmapBase(pkt.epsn()), pkt.epsn(), (bool)(pkt.flags() & ECN_CE), pkt.retransmitted(), pkt.csig_delay_ns(),
+                         pkt.csig_abw_enabled(), pkt.csig_abw_encoded());
+            ack_packet->set_probe_ack(true);
+            _nic.sendControlPacket(ack_packet, NULL, this);
+        } else {
+            UecAckPacket* ack_packet =
+                sack(pkt.path_id(), sackBitmapBase(pkt.epsn()), pkt.epsn(), (bool)(pkt.flags() & ECN_CE), pkt.retransmitted());
+            ack_packet->set_probe_ack(true);
+            _nic.sendControlPacket(ack_packet, NULL, this);
+        }
+        return;
     }
     //PCIeModel processing
 
@@ -2647,9 +3413,16 @@ void UecSink::processData(UecDataPacket& pkt) {
         // sender is confused and sending us duplicates: ACK straight away.
         // this code is different from the proposed hardware implementation, as it keeps track of
         // the ACK state of OOO packets.
-        UecAckPacket* ack_packet =
-            sack(pkt.path_id(), ecn ? pkt.epsn() : sackBitmapBase(pkt.epsn()), pkt.epsn(), ecn, pkt.retransmitted());
-        _nic.sendControlPacket(ack_packet, NULL, this);
+        if (pkt.csig_enabled() && pkt.csig_reflect_req()) {
+            UecAckCcxPacket* ack_packet =
+                sack_ccx(pkt.path_id(), ecn ? pkt.epsn() : sackBitmapBase(pkt.epsn()), pkt.epsn(), ecn, pkt.retransmitted(), pkt.csig_delay_ns(),
+                         pkt.csig_abw_enabled(), pkt.csig_abw_encoded());
+            _nic.sendControlPacket(ack_packet, NULL, this);
+        } else {
+            UecAckPacket* ack_packet =
+                sack(pkt.path_id(), ecn ? pkt.epsn() : sackBitmapBase(pkt.epsn()), pkt.epsn(), ecn, pkt.retransmitted());
+            _nic.sendControlPacket(ack_packet, NULL, this);
+        }
 
         _accepted_bytes = 0;  // careful about this one.
         return;
@@ -2712,29 +3485,52 @@ void UecSink::processData(UecDataPacket& pkt) {
              << " forceack " << force_ack << endl;
     }
     if (ecn || shouldSack() || force_ack) {
-        UecAckPacket* ack_packet =
-            sack(pkt.path_id(), (ecn || pkt.ar()) ? pkt.epsn() : sackBitmapBase(pkt.epsn()), pkt.epsn(), ecn, pkt.retransmitted());
+        if (pkt.csig_enabled() && pkt.csig_reflect_req()) {
+            UecAckCcxPacket* ack_packet =
+                sack_ccx(pkt.path_id(), (ecn || pkt.ar()) ? pkt.epsn() : sackBitmapBase(pkt.epsn()), pkt.epsn(), ecn, pkt.retransmitted(), pkt.csig_delay_ns(),
+                         pkt.csig_abw_enabled(), pkt.csig_abw_encoded());
 
-        if (_src->debug()) {
-            cout << " UecSink " << _nodename << " src " << _src->nodename()
-                 << " sendAckNow: " << _expected_epsn << " ref_epsn " << pkt.epsn()
-                 << " ooo_count " << _out_of_order_count
-                 << " recvd_bytes " << _recvd_bytes << " flow " << _src->flow()->str() 
-                 << " ecn " << ecn << " shouldSack " << shouldSack() << " forceack " << force_ack << endl;
+            if (_src->debug()) {
+                cout << " UecSink " << _nodename << " src " << _src->nodename()
+                     << " sendAckCcxNow: " << _expected_epsn << " ref_epsn " << pkt.epsn()
+                     << " ooo_count " << _out_of_order_count
+                     << " recvd_bytes " << _recvd_bytes << " flow " << _src->flow()->str()
+                     << " ecn " << ecn << " csig_delay_ns " << pkt.csig_delay_ns() << endl;
+            }
+
+            if (_src->flow()->flow_id() == UecSrc::_debug_flowid)
+            {
+                cout << timeAsUs(_src->eventlist().now()) << " flowid " << _src->flow()->flow_id()
+                     << " sendAckCcxNow: " << _expected_epsn << " ref_epsn " << pkt.epsn()
+                     << " ooo_count " << _out_of_order_count
+                     << " recvd_bytes " << _recvd_bytes << " flow " << _src->flow()->str()
+                     << " ecn " << ecn << " csig_delay_ns " << pkt.csig_delay_ns() << endl;
+            }
+            _accepted_bytes = 0;
+            _nic.sendControlPacket(ack_packet, NULL, this);
+        } else {
+            UecAckPacket* ack_packet =
+                sack(pkt.path_id(), (ecn || pkt.ar()) ? pkt.epsn() : sackBitmapBase(pkt.epsn()), pkt.epsn(), ecn, pkt.retransmitted());
+
+            if (_src->debug()) {
+                cout << " UecSink " << _nodename << " src " << _src->nodename()
+                     << " sendAckNow: " << _expected_epsn << " ref_epsn " << pkt.epsn()
+                     << " ooo_count " << _out_of_order_count
+                     << " recvd_bytes " << _recvd_bytes << " flow " << _src->flow()->str()
+                     << " ecn " << ecn << " shouldSack " << shouldSack() << " forceack " << force_ack << endl;
+            }
+
+            if (_src->flow()->flow_id() == UecSrc::_debug_flowid)
+            {
+                cout << timeAsUs(_src->eventlist().now()) << " flowid " << _src->flow()->flow_id()
+                     << " sendAckNow: " << _expected_epsn << " ref_epsn " << pkt.epsn()
+                     << " ooo_count " << _out_of_order_count
+                     << " recvd_bytes " << _recvd_bytes << " flow " << _src->flow()->str()
+                     << " ecn " << ecn << " shouldSack " << shouldSack() << " forceack " << force_ack << endl;
+            }
+            _accepted_bytes = 0;
+            _nic.sendControlPacket(ack_packet, NULL, this);
         }
-
-        if (_src->flow()->flow_id() == UecSrc::_debug_flowid)
-        {
-            cout << timeAsUs(_src->eventlist().now()) << " flowid " << _src->flow()->flow_id()
-                 << " sendAckNow: " << _expected_epsn << " ref_epsn " << pkt.epsn()
-                 << " ooo_count " << _out_of_order_count
-                 << " recvd_bytes " << _recvd_bytes << " flow " << _src->flow()->str() 
-                 << " ecn " << ecn << " shouldSack " << shouldSack() << " forceack " << force_ack << endl;
-        }
-        _accepted_bytes = 0;
-
-        // ack_packet->sendOn();
-        _nic.sendControlPacket(ack_packet, NULL, this);
     }
 }
 
@@ -2759,9 +3555,14 @@ void UecSink::processTrimmed(const UecDataPacket& pkt) {
                  << " time " << timeAsNs(getSrc()->eventlist().now()) << " flow"
                  << _src->flow()->str() << endl;
 
-        UecAckPacket* ack_packet = sack(pkt.path_id(), sackBitmapBase(pkt.epsn()), pkt.epsn(), false, pkt.retransmitted());
-        //ack_packet->sendOn();
-        _nic.sendControlPacket(ack_packet, NULL, this);
+        if (pkt.csig_enabled() && pkt.csig_reflect_req()) {
+            UecAckCcxPacket* ack_packet = sack_ccx(pkt.path_id(), sackBitmapBase(pkt.epsn()), pkt.epsn(), false, pkt.retransmitted(), pkt.csig_delay_ns(),
+                                                   pkt.csig_abw_enabled(), pkt.csig_abw_encoded());
+            _nic.sendControlPacket(ack_packet, NULL, this);
+        } else {
+            UecAckPacket* ack_packet = sack(pkt.path_id(), sackBitmapBase(pkt.epsn()), pkt.epsn(), false, pkt.retransmitted());
+            _nic.sendControlPacket(ack_packet, NULL, this);
+        }
         return;
     }
 
@@ -2776,10 +3577,14 @@ void UecSink::processTrimmed(const UecDataPacket& pkt) {
              << " rtx_backlog " << rtx_backlog() << " at " << timeAsUs(getSrc()->eventlist().now())
              << " flow " << _src->flow()->str() << endl;
 
-    UecNackPacket* nack_packet = nack(pkt.path_id(), pkt.epsn(), is_last_hop, (bool)(pkt.flags() & ECN_CE));
-
-    // nack_packet->sendOn();
-    _nic.sendControlPacket(nack_packet, NULL, this);
+    if (pkt.csig_enabled() && pkt.csig_reflect_req()) {
+        UecNackCcxPacket* nack_packet = nack_ccx(pkt.path_id(), pkt.epsn(), is_last_hop, (bool)(pkt.flags() & ECN_CE), pkt.csig_delay_ns(),
+                                                  pkt.csig_abw_enabled(), pkt.csig_abw_encoded());
+        _nic.sendControlPacket(nack_packet, NULL, this);
+    } else {
+        UecNackPacket* nack_packet = nack(pkt.path_id(), pkt.epsn(), is_last_hop, (bool)(pkt.flags() & ECN_CE));
+        _nic.sendControlPacket(nack_packet, NULL, this);
+    }
 
     if (UecSrc::_receiver_based_cc && !_in_pull) {
         // source is now retransmitting, must add it to the list.
@@ -3016,6 +3821,36 @@ UecNackPacket* UecSink::nack(uint16_t path_id, UecBasePacket::seq_t seqno,bool l
     return pkt;
 }
 
+UecAckCcxPacket* UecSink::sack_ccx(uint16_t path_id, UecBasePacket::seq_t seqno, UecBasePacket::seq_t acked_psn, bool ce, bool rtx_echo, uint32_t csig_delay_ns,
+                                   bool csig_abw_valid, uint32_t csig_abw_encoded) {
+    uint64_t bitmap = buildSackBitmap(seqno);
+    UecAckCcxPacket* pkt =
+        UecAckCcxPacket::newpkt(_flow, NULL, _expected_epsn, seqno, acked_psn, path_id, ce, _recvd_bytes, _rcv_cwnd_pen,
+                                CCX_TYPE_NSCC_CSIG, csig_delay_ns, _srcaddr);
+    pkt->set_bitmap(bitmap);
+    pkt->set_ooo(_out_of_order_count);
+    pkt->set_rtx_echo(rtx_echo);
+    pkt->set_probe_ack(false);
+    if (csig_abw_valid) {
+        pkt->set_csig_abw_valid(true);
+        pkt->set_csig_abw_encoded(csig_abw_encoded);
+    }
+    return pkt;
+}
+
+UecNackCcxPacket* UecSink::nack_ccx(uint16_t path_id, UecBasePacket::seq_t seqno, bool last_hop, bool ecn_echo, uint32_t csig_delay_ns,
+                                    bool csig_abw_valid, uint32_t csig_abw_encoded) {
+    UecNackCcxPacket* pkt = UecNackCcxPacket::newpkt(_flow, NULL, seqno, path_id, _recvd_bytes, _rcv_cwnd_pen,
+                                                      NCCX_TYPE_CSIG, csig_delay_ns, _srcaddr);
+    pkt->set_last_hop(last_hop);
+    pkt->set_ecn_echo(ecn_echo);
+    if (csig_abw_valid) {
+        pkt->set_csig_abw_valid(true);
+        pkt->set_csig_abw_encoded(csig_abw_encoded);
+    }
+    return pkt;
+}
+
 void UecSink::setEndTrigger(Trigger& end_trigger) {
     _end_trigger = &end_trigger;
 };
@@ -3168,5 +4003,3 @@ void UecPullPacer::requestPull(UecSink* sink) {
         _active = true;
     }
 }
-
-

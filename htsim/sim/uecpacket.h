@@ -15,6 +15,44 @@
 
 #define VALUE_NOT_SET -1
 
+// Linear 5-bit simulator approximation of CSIG min(ABW).
+#define CSIG_ABW_BUCKETS         32u
+#define CSIG_ABW_INITIAL_MIN_VAL 31u   // all-1b for 5-bit field
+
+extern uint64_t g_csig_abw_link_capacity_bps;
+extern uint64_t g_csig_link_capacity_bps;
+
+inline uint32_t csig_abw_initial_min() {
+    return CSIG_ABW_INITIAL_MIN_VAL;
+}
+
+inline uint32_t encode_csig_abw(uint64_t abw_bps) {
+    const uint64_t cap = g_csig_abw_link_capacity_bps;
+    if (cap == 0) return 0;
+    if (abw_bps >= cap) return CSIG_ABW_BUCKETS - 1;
+    uint64_t bucket = (abw_bps * (uint64_t)CSIG_ABW_BUCKETS) / cap;
+    if (bucket >= CSIG_ABW_BUCKETS) bucket = CSIG_ABW_BUCKETS - 1;
+    return (uint32_t)bucket;
+}
+
+inline uint64_t decode_csig_abw(uint32_t encoded) {
+    if (encoded >= CSIG_ABW_BUCKETS) encoded = CSIG_ABW_BUCKETS - 1;
+    uint64_t bucket_width = g_csig_abw_link_capacity_bps / CSIG_ABW_BUCKETS;
+    return (uint64_t)encoded * bucket_width + bucket_width / 2;
+}
+
+// Keep the all-ones bucket from decoding below line rate.
+inline uint64_t decode_csig_abw_for_scale(uint32_t encoded) {
+    if (encoded >= CSIG_ABW_BUCKETS - 1) {
+        return g_csig_abw_link_capacity_bps;
+    }
+    return decode_csig_abw(encoded);
+}
+
+inline bool csig_abw_less(uint32_t a, uint32_t b) {
+    return a < b;
+}
+
 class UecBasePacket : public Packet {
 public:
     enum PacketType {DATA_PULL = 0, DATA_SPEC = 1, DATA_RTX = 2, DATA_PROBE = 3};    
@@ -68,6 +106,13 @@ public:
         p->_trim_hop = {};
         p->_trim_direction = NONE;
 
+        p->_csig_enabled = false;
+        p->_csig_delay_ns = 0;
+        p->_csig_reflect_req = false;
+
+        p->_csig_abw_enabled = false;
+        p->_csig_abw_encoded = csig_abw_initial_min();
+
         return p;
     }
   
@@ -113,6 +158,19 @@ public:
 
     inline int32_t path_id() const {if (_pathid!=UINT32_MAX) return _pathid; else return _route->path_id();}
 
+    inline bool csig_enabled() const {return _csig_enabled;}
+    inline void set_csig_enabled(bool e) {_csig_enabled = e;}
+    inline uint32_t csig_delay_ns() const {return _csig_delay_ns;}
+    inline void set_csig_delay_ns(uint32_t d) {_csig_delay_ns = d;}
+    inline bool csig_reflect_req() const {return _csig_reflect_req;}
+    inline void set_csig_reflect_req(bool r) {_csig_reflect_req = r;}
+
+    // CSIG min(ABW), carried with CSIG delay in the delay+ABW mode.
+    inline bool csig_abw_enabled() const {return _csig_abw_enabled;}
+    inline void set_csig_abw_enabled(bool e) {_csig_abw_enabled = e;}
+    inline uint32_t csig_abw_encoded() const {return _csig_abw_encoded;}
+    inline void set_csig_abw_encoded(uint32_t v) {_csig_abw_encoded = v;}
+
     virtual PktPriority priority() const {
         if (_is_header) {
             return Packet::PRIO_HI;
@@ -136,6 +194,14 @@ protected:
     //trim information, need to see if this stays here or goes to separate header.
     std::optional<int32_t> _trim_hop;
     packet_direction _trim_direction;
+
+    bool _csig_enabled;
+    uint32_t _csig_delay_ns;
+    bool _csig_reflect_req;
+
+    bool _csig_abw_enabled;
+    uint32_t _csig_abw_encoded;  // compact 5-bit bucket index
+
     static PacketDB<UecDataPacket> _packetdb;
 };
 
@@ -333,6 +399,193 @@ protected:
     bool _rnr;
     bool _ecn_echo;
     static PacketDB<UecNackPacket> _packetdb;
+};
+
+// CCX_TYPE values per CSIG-Spec-0.50 Table 8
+#define CCX_TYPE_NSCC_CSIG 0
+#define CCX_TYPE_RCCC_CSIG 1
+
+// NCCX_TYPE values per CSIG-Spec-0.50 Table 9
+#define NCCX_TYPE_CSIG 0
+
+class UecAckCcxPacket : public UecBasePacket {
+    using Packet::set_route;
+public:
+    inline static UecAckCcxPacket* newpkt(PacketFlow &flow, const Route *route,
+                                          seq_t cumulative_ack, seq_t ref_ack, seq_t acked_psn,
+                                          uint16_t path_id, bool ecn_marked, uint64_t recv_bytes, uint8_t rcv_wnd_pen,
+                                          uint8_t ccx_type, uint32_t csig_delay_ns,
+                                          uint32_t destination = UINT32_MAX) {
+        UecAckCcxPacket* p = _packetdb.allocPacket();
+        p->set_attrs(flow, ACKSIZE, 0);
+        if (route) {
+            p->set_route();
+        }
+
+        assert(p->size()==ACKSIZE);
+        p->_type = UECACKCCX;
+        p->_is_header = true;
+        p->_bounced = false;
+        p->_ref_ack = ref_ack;
+        p->_acked_psn = acked_psn;
+        p->_cumulative_ack = cumulative_ack;
+        p->_ev = path_id;
+        p->set_pathid(path_id);
+        p->_direction = NONE;
+        p->_sack_bitmap = 0;
+        p->_ecn_echo = ecn_marked;
+        p->set_dst(destination);
+        p->_recvd_bytes = recv_bytes;
+        p->_rcv_cwnd_pen = rcv_wnd_pen;
+
+        p->_ccx_type = ccx_type;
+        p->_csig_delay_ns = csig_delay_ns;
+
+        p->_csig_abw_valid = false;
+        p->_csig_abw_encoded = csig_abw_initial_min();
+
+        // PacketDB recycles packet objects; explicitly reset the fields that
+        // setters update later so a freshly issued ACK_CCX never inherits
+        // stale state from a previously freed packet.
+        p->_rtx_echo = false;
+        p->_is_rts = false;
+        p->_is_probe_ack = false;
+        p->_out_of_order_count = 0;
+
+        return p;
+    }
+
+    void free() {set_pathid(UINT32_MAX), _packetdb.freePacket(this);}
+
+    inline seq_t ref_ack() const {return _ref_ack;}
+    inline seq_t acked_psn() const {return _acked_psn;}
+    inline seq_t cumulative_ack() const {return _cumulative_ack;}
+    inline uint64_t recvd_bytes() const {return _recvd_bytes;}
+    inline uint8_t rcv_wnd_pen() const {return _rcv_cwnd_pen;}
+    inline void set_ooo(uint32_t out_of_order_count) { _out_of_order_count = out_of_order_count;}
+    inline uint32_t ooo() const {return _out_of_order_count; }
+    inline void set_is_rts(bool is_rts) { _is_rts = is_rts;}
+    inline bool is_rts() const {return _is_rts; }
+    inline void set_bitmap(uint64_t bitmap){_sack_bitmap = bitmap;};
+    uint16_t ev() const {return _ev;}
+    inline bool ecn_echo() const {return _ecn_echo;}
+    uint64_t bitmap() const {return _sack_bitmap;}
+
+    void set_probe_ack(bool probe_ack){ _is_probe_ack = probe_ack; }
+    inline bool is_probe_ack() const {return _is_probe_ack;}
+    inline void set_rtx_echo(bool rtx_bit){_rtx_echo = rtx_bit;};
+    inline bool rtx_echo() const {return _rtx_echo;}
+
+    inline uint8_t ccx_type() const {return _ccx_type;}
+    inline uint32_t csig_delay_ns() const {return _csig_delay_ns;}
+
+    // _valid separates absent ABW from bucket 0.
+    inline bool csig_abw_valid() const {return _csig_abw_valid;}
+    inline void set_csig_abw_valid(bool v) {_csig_abw_valid = v;}
+    inline uint32_t csig_abw_encoded() const {return _csig_abw_encoded;}
+    inline void set_csig_abw_encoded(uint32_t v) {_csig_abw_encoded = v;}
+
+    virtual PktPriority priority() const {return Packet::PRIO_HI;}
+    virtual ~UecAckCcxPacket(){}
+
+protected:
+    seq_t _ref_ack;
+    seq_t _acked_psn;
+    seq_t _cumulative_ack;
+    uint64_t _sack_bitmap;
+    uint16_t _ev;
+    uint64_t _recvd_bytes;
+    uint8_t _rcv_cwnd_pen;
+    bool _ecn_echo;
+    bool _rtx_echo;
+    bool _is_rts = false;
+    uint32_t _out_of_order_count;
+    bool _is_probe_ack;
+
+    uint8_t _ccx_type;
+    uint32_t _csig_delay_ns;
+
+    bool _csig_abw_valid;
+    uint32_t _csig_abw_encoded;
+
+    static PacketDB<UecAckCcxPacket> _packetdb;
+};
+
+class UecNackCcxPacket : public UecBasePacket {
+    using Packet::set_route;
+public:
+    inline static UecNackCcxPacket* newpkt(PacketFlow &flow, const Route *route,
+                                            seq_t ref_epsn,
+                                            uint16_t path_id, uint64_t recv_bytes, uint64_t tbytes,
+                                            uint8_t nccx_type, uint32_t csig_delay_ns,
+                                            uint32_t destination = UINT32_MAX) {
+        UecNackCcxPacket* p = _packetdb.allocPacket();
+        p->set_attrs(flow, ACKSIZE, ref_epsn);
+        if (route) {
+            p->set_route();
+        }
+
+        assert(p->size()==ACKSIZE);
+        p->_type = UECNACKCCX;
+        p->_is_header = true;
+        p->_bounced = false;
+        p->_ref_epsn = ref_epsn;
+        p->_ev = path_id;
+        p->set_pathid(path_id);
+        p->_ecn_echo = false;
+        p->_direction = NONE;
+        p->_path_len = 0;
+        p->set_dst(destination);
+        p->_recvd_bytes = recv_bytes;
+        p->_target_bytes = tbytes;
+        p->_last_hop = false;
+
+        p->_nccx_type = nccx_type;
+        p->_csig_delay_ns = csig_delay_ns;
+
+        p->_csig_abw_valid = false;
+        p->_csig_abw_encoded = csig_abw_initial_min();
+
+        return p;
+    }
+
+    void free() {set_pathid(UINT32_MAX), _packetdb.freePacket(this);}
+
+    inline seq_t ref_ack() const {return _ref_epsn;}
+    uint16_t ev() const {return _ev;}
+    inline void set_ecn_echo(bool ecn_echo) {_ecn_echo = ecn_echo;}
+    inline bool ecn_echo() const {return _ecn_echo;}
+    inline uint64_t recvd_bytes() const {return _recvd_bytes;}
+    inline uint64_t target_bytes() const {return _target_bytes;}
+    inline void set_last_hop(bool lh){ _last_hop = lh;}
+    inline bool last_hop() const { return _last_hop;}
+
+    inline uint8_t nccx_type() const {return _nccx_type;}
+    inline uint32_t csig_delay_ns() const {return _csig_delay_ns;}
+
+    inline bool csig_abw_valid() const {return _csig_abw_valid;}
+    inline void set_csig_abw_valid(bool v) {_csig_abw_valid = v;}
+    inline uint32_t csig_abw_encoded() const {return _csig_abw_encoded;}
+    inline void set_csig_abw_encoded(uint32_t v) {_csig_abw_encoded = v;}
+
+    virtual PktPriority priority() const {return Packet::PRIO_HI;}
+    virtual ~UecNackCcxPacket(){}
+
+protected:
+    seq_t _ref_epsn;
+    uint16_t _ev;
+    uint64_t _recvd_bytes;
+    uint64_t _target_bytes;
+    bool _last_hop;
+    bool _ecn_echo;
+
+    uint8_t _nccx_type;
+    uint32_t _csig_delay_ns;
+
+    bool _csig_abw_valid;
+    uint32_t _csig_abw_encoded;
+
+    static PacketDB<UecNackCcxPacket> _packetdb;
 };
 
 class UecRtsPacket : public UecDataPacket {

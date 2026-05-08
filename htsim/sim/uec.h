@@ -220,6 +220,22 @@ public:
 
     static bool update_base_rtt_on_nack;
     static bool _enable_sleek;
+    static bool _nscc_csig_enabled;
+    static bool _csig_trace_enabled;
+    // Poseidon rate-mode knobs.
+    static double _nscc_csig_poseidon_m;
+    static bool _nscc_csig_poseidon_rate_enabled;
+    static double _poseidon_p_bytes;
+    static double _poseidon_k_bytes;
+    static uint64_t _poseidon_min_rate_bps;
+    static uint64_t _poseidon_max_rate_bps;
+    static uint64_t _poseidon_init_rate_bps;
+
+    // CSIG delay+ABW: max-hop delay drives decrease; min(ABW) gates recovery.
+    static bool _nscc_csig_delay_abw_enabled;
+    static double _csig_delay_abw_target_divisor;
+    static double _csig_delay_abw_gain;
+    static double _csig_delay_abw_low_frac;
 
     virtual const string& nodename() { return _nodename; }
     virtual void setName(const string& name) override { _name=name; _mp->set_debug_tag(name); }
@@ -291,7 +307,29 @@ public:
     mem_b handleCumulativeAck(UecDataPacket::seq_t cum_ack);
     void processAck(const UecAckPacket& pkt);
     void processNack(const UecNackPacket& pkt);
+    void processAckCcx(const UecAckCcxPacket& pkt);
+    void processNackCcx(const UecNackCcxPacket& pkt);
     void processPull(const UecPullPacket& pkt);
+
+    // Common bookkeeping shared by processAck and processAckCcx.
+    struct AckFields {
+        UecBasePacket::seq_t cum_ack;
+        UecBasePacket::seq_t acked_psn;
+        UecBasePacket::seq_t ref_ack;
+        uint64_t bitmap;
+        uint64_t recvd_bytes;
+        uint8_t rcv_wnd_pen;
+        uint16_t ev;
+        uint32_t ooo;
+        bool ecn_echo;
+        bool rtx_echo;
+        bool is_rts;
+        bool is_probe_ack;
+    };
+    void processAckCommon(const AckFields& f, simtime_picosec delay,
+                          simtime_picosec raw_rtt, simtime_picosec send_time,
+                          mem_b pkt_size);
+
     void runSleek(uint32_t ooo, UecBasePacket::seq_t cum_ack);
 
     //added for NSCC
@@ -374,12 +412,33 @@ public:
     //debug
     static flowid_t _debug_flowid;
 private:
-    bool quick_adapt(bool is_loss, bool skip, simtime_picosec delay);
+    // NSCC helpers.
+    bool quick_adapt(bool is_loss, bool skip, simtime_picosec delay,
+                     double effective_qa_threshold);
     void fair_increase(uint32_t newly_acked_bytes);
-    void proportional_increase(uint32_t newly_acked_bytes,simtime_picosec delay);
+    void proportional_increase(uint32_t newly_acked_bytes, simtime_picosec delay,
+                               simtime_picosec effective_target);
     void fast_increase(uint32_t newly_acked_bytes,simtime_picosec delay);
     // void fair_decrease(bool can_decrease, uint32_t newly_acked_bytes);
-    void multiplicative_decrease();
+    void multiplicative_decrease(simtime_picosec delay,
+                                 simtime_picosec effective_target);
+    // Poseidon rate-mode helpers.
+    double poseidon_rate_mpt_bytes(uint64_t rate_bps) const;
+    double poseidon_rate_update_ratio_bytes(double mpd_bytes,
+                                            double mpt_bytes) const;
+    void poseidon_rate_init_if_needed();
+    void poseidon_rate_on_ack(simtime_picosec csig_delay_ps,
+                              simtime_picosec raw_rtt,
+                              mem_b newly_acked_bytes);
+    bool csig_delay_abw_on_ack(bool skip,
+                               simtime_picosec csig_delay_ps,
+                               bool csig_abw_valid,
+                               uint64_t csig_abw_bps,
+                               mem_b newly_acked_bytes);
+    void poseidon_rate_on_nack();
+    void poseidon_rate_on_rto();
+    void poseidon_rate_recompute_cwnd();
+    simtime_picosec poseidon_rate_gate_delay_ps() const;
     void fulfill_adjustment();
     void mark_packet_for_retransmission(UecBasePacket::seq_t psn, uint16_t pktsize);
     void update_delay(simtime_picosec delay, bool update_avg, bool skip);
@@ -412,6 +471,37 @@ private:
     uint32_t _bytes_ignored = 0;
     uint32_t _inc_bytes = 0;
     simtime_picosec _avg_delay = 0;
+
+    // Last reflected min(ABW) value.
+    uint64_t _last_csig_abw_bps = 0;
+    uint32_t _last_csig_abw_encoded = CSIG_ABW_INITIAL_MIN_VAL;
+
+    const char* _last_nscc_branch = "none";
+
+    mem_b _last_abw_budget_bytes = 0;
+    mem_b _last_abw_delta_bytes  = 0;
+    simtime_picosec _last_target_hop_delay = 0;
+    simtime_picosec _last_effective_target_Qdelay = 0;
+    const char* _last_control_mode = "nscc_legacy";
+    simtime_picosec _last_poseidon_mpd = 0;
+    simtime_picosec _last_poseidon_mpt = 0;
+    double _last_poseidon_raw_U = 1.0;
+    double _last_poseidon_applied_U = 1.0;
+
+    // Poseidon rate-mode state.
+    uint64_t _poseidon_rate_bps = 0;
+    simtime_picosec _poseidon_next_send_time = 0;
+    mem_b _poseidon_last_pkt_size = 0;
+    bool _poseidon_first_ack = true;
+    bool _poseidon_wake_pending = false;
+
+    // Poseidon trace fields.
+    double _last_poseidon_mpd_bytes = 0.0;
+    double _last_poseidon_mpt_bytes = 0.0;
+    uint64_t _last_poseidon_rate_before_bps = 0;
+    uint64_t _last_poseidon_rate_after_bps  = 0;
+    const char* _last_poseidon_loss_event = "none";
+    double _last_poseidon_cwnd_pkts = 1.0;
 
     simtime_picosec _last_eta_time = 0;
     simtime_picosec _last_adjust_time = 0;
@@ -503,8 +593,12 @@ class UecSink : public DataReceiver {
     UecBasePacket::seq_t sackBitmapBaseIdeal();
     uint64_t buildSackBitmap(UecBasePacket::seq_t ref_epsn);
     UecAckPacket* sack(uint16_t path_id, UecBasePacket::seq_t seqno, UecBasePacket::seq_t acked_psn, bool ce, bool rtx_echo);
+    UecAckCcxPacket* sack_ccx(uint16_t path_id, UecBasePacket::seq_t seqno, UecBasePacket::seq_t acked_psn, bool ce, bool rtx_echo, uint32_t csig_delay_ns,
+                              bool csig_abw_valid = false, uint32_t csig_abw_encoded = 0);
 
     UecNackPacket* nack(uint16_t path_id, UecBasePacket::seq_t seqno, bool last_hop, bool ecn_echo);
+    UecNackCcxPacket* nack_ccx(uint16_t path_id, UecBasePacket::seq_t seqno, bool last_hop, bool ecn_echo, uint32_t csig_delay_ns,
+                               bool csig_abw_valid = false, uint32_t csig_abw_encoded = 0);
 
     UecBasePacket::pull_quanta backlog() {
         if (_highest_pull_target > _latest_pull)

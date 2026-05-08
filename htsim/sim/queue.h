@@ -65,6 +65,14 @@ class BaseQueue  : public EventSource, public PacketSink, public Drawable {
     virtual uint64_t quantized_queuesize();
     virtual uint8_t quantized_utilization();
 
+    // Current drain time of queued bytes at this output link.
+    virtual simtime_picosec current_queueing_delay() const {
+        return (simtime_picosec)(queuesize() * _ps_per_byte);
+    }
+
+    // Windowed simulator estimate used as the CSIG min(ABW) source.
+    virtual uint64_t current_available_bandwidth_bps();
+
     static simtime_picosec _update_period;
 
 protected:

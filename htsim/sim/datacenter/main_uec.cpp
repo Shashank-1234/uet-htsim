@@ -29,6 +29,7 @@
 #include "fat_tree_switch.h"
 
 #include <list>
+#include <algorithm>
 
 // Simulation params
 
@@ -71,6 +72,7 @@ int main(int argc, char **argv) {
     bool param_queuesize_set = false;
     uint32_t queuesize_pkt = 0;
     linkspeed_bps linkspeed = speedFromMbps((double)HOST_NIC);
+    uint64_t csig_abw_capacity_override = 0;
     int packet_size = 4150;
     uint32_t path_entropy_size = 64;
     uint32_t cwnd = 0, no_of_nodes = 0;
@@ -257,9 +259,69 @@ int main(int argc, char **argv) {
             }
             cout << "queue_type "<< qt << endl;
             i++;
+        } else if (!strcmp(argv[i],"-nscc_csig_delay")) {
+            UecSrc::_nscc_csig_enabled = true;
+        } else if (!strcmp(argv[i],"-nscc_csig_poseidon_m")) {
+            UecSrc::_nscc_csig_poseidon_m = atof(argv[i+1]);
+            cout << "Poseidon m = " << UecSrc::_nscc_csig_poseidon_m << endl;
+            i++;
+        } else if (!strcmp(argv[i],"-nscc_csig_poseidon_rate")) {
+            UecSrc::_nscc_csig_poseidon_rate_enabled = true;
+            cout << "Poseidon rate mode enabled" << endl;
+        } else if (!strcmp(argv[i],"-poseidon_p_bytes")) {
+            UecSrc::_poseidon_p_bytes = atof(argv[i+1]);
+            cout << "Poseidon P (bytes) = " << UecSrc::_poseidon_p_bytes << endl;
+            i++;
+        } else if (!strcmp(argv[i],"-poseidon_k_bytes")) {
+            UecSrc::_poseidon_k_bytes = atof(argv[i+1]);
+            cout << "Poseidon K (bytes) = " << UecSrc::_poseidon_k_bytes << endl;
+            i++;
+        } else if (!strcmp(argv[i],"-poseidon_min_rate_bps")) {
+            UecSrc::_poseidon_min_rate_bps = strtoull(argv[i+1], nullptr, 10);
+            cout << "Poseidon min rate (bps) = "
+                 << UecSrc::_poseidon_min_rate_bps << endl;
+            i++;
+        } else if (!strcmp(argv[i],"-poseidon_max_rate_bps")) {
+            UecSrc::_poseidon_max_rate_bps = strtoull(argv[i+1], nullptr, 10);
+            cout << "Poseidon max rate (bps) = "
+                 << UecSrc::_poseidon_max_rate_bps << endl;
+            i++;
+        } else if (!strcmp(argv[i],"-poseidon_init_rate_bps")) {
+            UecSrc::_poseidon_init_rate_bps = strtoull(argv[i+1], nullptr, 10);
+            cout << "Poseidon init rate (bps) = "
+                 << UecSrc::_poseidon_init_rate_bps << endl;
+            i++;
+        } else if (!strcmp(argv[i],"-nscc_csig_delay_abw")) {
+            UecSrc::_nscc_csig_delay_abw_enabled = true;
+            cout << "csig_delay_abw mode enabled" << endl;
+        } else if (!strcmp(argv[i],"-csig_delay_abw_target_divisor")) {
+            UecSrc::_csig_delay_abw_target_divisor = atof(argv[i+1]);
+            cout << "csig_delay_abw_target_divisor = "
+                 << UecSrc::_csig_delay_abw_target_divisor << endl;
+            i++;
+        } else if (!strcmp(argv[i],"-csig_delay_abw_gain")) {
+            UecSrc::_csig_delay_abw_gain = atof(argv[i+1]);
+            cout << "csig_delay_abw_gain = " << UecSrc::_csig_delay_abw_gain << endl;
+            i++;
+        } else if (!strcmp(argv[i],"-csig_delay_abw_low_frac")) {
+            UecSrc::_csig_delay_abw_low_frac = atof(argv[i+1]);
+            cout << "csig_delay_abw_low_frac = "
+                 << UecSrc::_csig_delay_abw_low_frac << endl;
+            i++;
+        } else if (!strcmp(argv[i],"-csig_abw_capacity_bps")) {
+            csig_abw_capacity_override = strtoull(argv[i+1], nullptr, 10);
+            cout << "csig_abw_capacity_bps override " << csig_abw_capacity_override << endl;
+            i++;
         } else if (!strcmp(argv[i],"-debug")) {
             UecSrc::_debug = true;
             UecPdcSes::_debug = true;
+        } else if (!strcmp(argv[i],"-debug_flowid")) {
+            UecSrc::_debug_flowid = (flowid_t)strtoul(argv[i+1], nullptr, 10);
+            cout << "debug_flowid " << UecSrc::_debug_flowid << endl;
+            i++;
+        } else if (!strcmp(argv[i],"-csig_trace")) {
+            UecSrc::_csig_trace_enabled = true;
+            cout << "csig_trace enabled" << endl;
         } else if (!strcmp(argv[i],"-host_queue_type")) {
             if (!strcmp(argv[i+1], "swift")) {
                 snd_type = SWIFT_SCHEDULER;
@@ -522,6 +584,54 @@ int main(int argc, char **argv) {
 
     cout << "Packet size (MTU) is " << packet_size << endl;
 
+    if (UecSrc::_nscc_csig_poseidon_rate_enabled) {
+        UecSrc::_nscc_csig_enabled = true;
+    }
+
+    const int active_csig_modes =
+        (UecSrc::_nscc_csig_poseidon_rate_enabled ? 1 : 0) +
+        (UecSrc::_nscc_csig_delay_abw_enabled ? 1 : 0);
+    if (active_csig_modes > 1) {
+        cerr << "FATAL: choose exactly one CSIG mode among "
+                "-nscc_csig_poseidon_rate and -nscc_csig_delay_abw." << endl;
+        return EXIT_FAILURE;
+    }
+    if (UecSrc::_nscc_csig_enabled && active_csig_modes == 0) {
+        cerr << "FATAL: bare -nscc_csig_delay is no longer a supported "
+                "evaluation mode. Use -nscc_csig_poseidon_rate, "
+                "or -nscc_csig_delay_abw." << endl;
+        return EXIT_FAILURE;
+    }
+    // Resolve Poseidon defaults after CLI parsing.
+    if (UecSrc::_poseidon_max_rate_bps == 0) {
+        UecSrc::_poseidon_max_rate_bps = (uint64_t)linkspeed;
+    }
+    if (UecSrc::_poseidon_init_rate_bps == 0) {
+        UecSrc::_poseidon_init_rate_bps = UecSrc::_poseidon_max_rate_bps;
+    }
+    if (UecSrc::_poseidon_min_rate_bps == 0) {
+        const uint64_t hundred_mbps = 100ULL * 1000000ULL;
+        const uint64_t max_over_1k  = UecSrc::_poseidon_max_rate_bps / 1000ULL;
+        UecSrc::_poseidon_min_rate_bps = std::min(hundred_mbps, max_over_1k);
+        if (UecSrc::_poseidon_min_rate_bps == 0) UecSrc::_poseidon_min_rate_bps = 1;
+    }
+    if (UecSrc::_nscc_csig_poseidon_rate_enabled) {
+        cout << "Poseidon rate config: min="     << UecSrc::_poseidon_min_rate_bps
+             << " bps, init="                    << UecSrc::_poseidon_init_rate_bps
+             << " bps, max="                     << UecSrc::_poseidon_max_rate_bps
+             << " bps, P=" << UecSrc::_poseidon_p_bytes
+             << " B, K="   << UecSrc::_poseidon_k_bytes
+             << " B, m="   << UecSrc::_nscc_csig_poseidon_m
+             << endl;
+    }
+    if (UecSrc::_nscc_csig_delay_abw_enabled) {
+        cout << "CSIG delay+ABW config: target_divisor="
+             << UecSrc::_csig_delay_abw_target_divisor
+             << " abw_gain=" << UecSrc::_csig_delay_abw_gain
+             << " low_frac=" << UecSrc::_csig_delay_abw_low_frac
+             << endl;
+    }
+
     srand(seed);
     srandom(seed);
     cout << "Parsed args\n";
@@ -577,6 +687,15 @@ int main(int argc, char **argv) {
     Logfile logfile(filename.str(), eventlist);
 
     cout << "Linkspeed set to " << linkspeed/1000000000 << "Gbps" << endl;
+
+    g_csig_abw_link_capacity_bps = csig_abw_capacity_override
+                                       ? csig_abw_capacity_override
+                                       : (uint64_t)linkspeed;
+    cout << "csig_abw_capacity_bps " << g_csig_abw_link_capacity_bps << endl;
+
+    g_csig_link_capacity_bps = (uint64_t)linkspeed;
+    cout << "csig_link_capacity_bps " << g_csig_link_capacity_bps << endl;
+
     logfile.setStartTime(timeFromSec(0));
 
     vector<unique_ptr<UecNIC>> nics;
@@ -1072,4 +1191,3 @@ int main(int argc, char **argv) {
 
     return EXIT_SUCCESS;
 }
-

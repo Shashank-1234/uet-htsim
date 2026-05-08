@@ -1,6 +1,7 @@
-// -*- c-basic-offset: 4; indent-tabs-mode: nil -*-        
+// -*- c-basic-offset: 4; indent-tabs-mode: nil -*-
 #include <sstream>
 #include <math.h>
+#include <algorithm>
 #include "queue.h"
 #include "ndppacket.h"
 #include "queue_lossless.h"
@@ -42,6 +43,14 @@ BaseQueue::log_packet_send(simtime_picosec duration){
         else
             break;
     }
+}
+
+uint64_t
+BaseQueue::current_available_bandwidth_bps() {
+    double util = average_utilization() / 100.0;
+    util = std::clamp(util, 0.0, 1.0);
+    uint64_t used_bps = (uint64_t)(util * (double)_bitrate);
+    return used_bps >= (uint64_t)_bitrate ? 0u : (uint64_t)_bitrate - used_bps;
 }
 
 uint16_t
