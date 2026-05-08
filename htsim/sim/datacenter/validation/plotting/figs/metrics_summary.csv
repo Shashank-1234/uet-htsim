@@ -1,0 +1,28 @@
+scenario,mode,stage,M,N,tracked_flow_id,tracked_flow_gbps,fair_share_gbps,tracked_over_fair,active_observed,active_expected,aggregate_observed_gbps,jain_observed,fairness_valid
+paper14_multihop_mn,NSCC-RTT,0-100 ms,0,2,1,65.6092,66.6667,0.9841,3,3,199.9729,0.9998,True
+paper14_multihop_mn,NSCC-RTT,100-200 ms,2,2,1,56.9918,66.6667,0.8549,5,3,599.9373,0.7703,True
+paper14_multihop_mn,NSCC-RTT,200-300 ms,2,9,1,18.8576,20.0000,0.9429,12,10,599.9974,0.3571,True
+paper14_multihop_mn,NSCC-RTT,300-400 ms,9,9,1,15.3613,20.0000,0.7681,19,10,1934.2695,0.5805,True
+paper14_multihop_mn,NSCC-RTT,400-500 ms,9,19,1,8.7250,10.0000,0.8725,29,20,1934.0404,0.3825,True
+paper14_multihop_mn,CSIG-Poseidon,0-100 ms,0,2,1,62.7364,66.6667,0.9410,3,3,190.7496,0.9999,True
+paper14_multihop_mn,CSIG-Poseidon,100-200 ms,2,2,1,61.6003,66.6667,0.9240,5,3,558.5671,0.7836,True
+paper14_multihop_mn,CSIG-Poseidon,200-300 ms,2,9,1,19.2407,20.0000,0.9620,12,10,561.1016,0.3679,True
+paper14_multihop_mn,CSIG-Poseidon,300-400 ms,9,9,1,18.1033,20.0000,0.9052,19,10,1769.0929,0.5890,True
+paper14_multihop_mn,CSIG-Poseidon,400-500 ms,9,19,1,9.2904,10.0000,0.9290,29,20,1771.9072,0.3899,True
+paper14_multihop_mn,CSIG delay+ABW,0-100 ms,0,2,1,70.1197,66.6667,1.0518,3,3,199.9729,0.9924,True
+paper14_multihop_mn,CSIG delay+ABW,100-200 ms,2,2,1,70.0138,66.6667,1.0502,5,3,599.9399,0.7706,True
+paper14_multihop_mn,CSIG delay+ABW,200-300 ms,2,9,1,12.9845,20.0000,0.6492,12,10,599.9522,0.3561,True
+paper14_multihop_mn,CSIG delay+ABW,300-400 ms,9,9,1,12.9019,20.0000,0.6451,19,10,1821.6156,0.5837,True
+paper14_multihop_mn,CSIG delay+ABW,400-500 ms,9,19,1,6.6204,10.0000,0.6620,29,20,1825.8948,0.3848,True
+paper17_high_concurrency,NSCC-RTT,50 flows,,50,1,2.7954,4.0000,0.6989,50,50,199.7724,0.5346,True
+paper17_high_concurrency,NSCC-RTT,100 flows,,100,1,1.6746,2.0000,0.8373,100,100,199.6119,0.9458,True
+paper17_high_concurrency,NSCC-RTT,150 flows,,150,1,1.3094,1.3333,0.9821,146,150,199.8507,NaN,False
+paper17_high_concurrency,NSCC-RTT,200 flows,,200,1,0.9787,1.0000,0.9787,196,200,198.1336,NaN,False
+paper17_high_concurrency,CSIG-Poseidon,50 flows,,50,1,3.8419,4.0000,0.9605,50,50,198.3873,0.9965,True
+paper17_high_concurrency,CSIG-Poseidon,100 flows,,100,1,1.7224,2.0000,0.8612,100,100,198.4470,0.9844,True
+paper17_high_concurrency,CSIG-Poseidon,150 flows,,150,1,0.9017,1.3333,0.6763,150,150,198.3089,0.9723,True
+paper17_high_concurrency,CSIG-Poseidon,200 flows,,200,1,1.0226,1.0000,1.0226,200,200,198.1336,0.9625,True
+paper17_high_concurrency,CSIG delay+ABW,50 flows,,50,1,5.4780,4.0000,1.3695,50,50,199.7139,0.7177,True
+paper17_high_concurrency,CSIG delay+ABW,100 flows,,100,1,1.8698,2.0000,0.9349,100,100,197.5506,0.9932,True
+paper17_high_concurrency,CSIG delay+ABW,150 flows,,150,1,1.0106,1.3333,0.7580,150,150,196.6170,0.9597,True
+paper17_high_concurrency,CSIG delay+ABW,200 flows,,200,1,0.9455,1.0000,0.9455,200,200,195.6702,0.9950,True
